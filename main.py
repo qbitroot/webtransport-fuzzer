@@ -69,6 +69,7 @@ class WebTransportClientProtocol(QuicConnectionProtocol):
                 self._session_established.set()
             else:
                 logger.error(f"WebTransport handshake failed: {status}")
+                logger.error(f"Headers: {headers}")
                 
         elif isinstance(event, WebTransportStreamDataReceived):
             logger.debug(f"Received {len(event.data)} bytes on stream {event.stream_id}")
@@ -105,7 +106,7 @@ class WebTransportClientProtocol(QuicConnectionProtocol):
     
     def send_stream_data(self, data: bytes):
         """Send data on a bidirectional WebTransport stream."""
-        if not self._session_id or not self._http:
+        if self._session_id is None or not self._http:
             raise RuntimeError("Session not established")
         
         # Create new bidirectional stream
@@ -171,7 +172,8 @@ class WebTransportConnection(ITargetConnection):
         configuration = QuicConfiguration(
             alpn_protocols=H3_ALPN,
             is_client=True,
-            verify_mode=False  # Disable cert verification for testing
+            verify_mode=False,  # Disable cert verification for testing
+            max_datagram_frame_size=65536,  # Enable datagram support
         )
         
         # Connect
