@@ -92,7 +92,7 @@ class WebTransportClientProtocol(QuicConnectionProtocol):
             (b":authority", authority.encode()),
             (b":path", path.encode()),
             (b":protocol", b"webtransport"),
-            (b"sec-webtransport-http3-draft", b"draft02"),
+            (b"sec-webtransport-http3-draft", b"draft-ietf-webtrans-http3-14"),
         ]
         
         self._http.send_headers(stream_id=stream_id, headers=headers)
