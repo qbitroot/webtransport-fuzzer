@@ -139,6 +139,7 @@ class WebTransportConnection(ITargetConnection):
         self._protocol = None
         self._loop = None
         self._client_context = None
+        self._last_sent_data = None
         
         # Parse URL
         parsed = urlparse(url)
@@ -213,6 +214,7 @@ class WebTransportConnection(ITargetConnection):
         logger.debug(f"Sending {len(data)} bytes")
         
         try:
+            self._last_sent_data = data
             self._protocol.send_stream_data(data)
             return len(data)
         except Exception as e:
@@ -232,7 +234,18 @@ class WebTransportConnection(ITargetConnection):
             received = self._protocol.get_received_data()
             if received:
                 all_data = b"".join(received.values())
-                return all_data[:max_bytes]
+                response = all_data[:max_bytes]
+                
+                # Check if echo response matches what we sent
+                if self._last_sent_data is not None:
+                    if response == self._last_sent_data:
+                        logger.info("✓ Echo response matches sent data")
+                    else:
+                        logger.warning(f"✗ Echo mismatch! Sent {len(self._last_sent_data)} bytes, received {len(response)} bytes")
+                        logger.warning(f"  Sent: {self._last_sent_data[:100]}")
+                        logger.warning(f"  Recv: {response[:100]}")
+                
+                return response
         except Exception as e:
             logger.debug(f"Recv error: {e}")
         
