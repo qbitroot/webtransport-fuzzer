@@ -239,11 +239,11 @@ class WebTransportConnection(ITargetConnection):
                 # Check if echo response matches what we sent
                 if self._last_sent_data is not None:
                     if response == self._last_sent_data:
-                        logger.info("✓ Echo response matches sent data")
+                        logger.info("Echo response matches sent data")
                     else:
-                        logger.warning(f"✗ Echo mismatch! Sent {len(self._last_sent_data)} bytes, received {len(response)} bytes")
-                        logger.warning(f"  Sent: {self._last_sent_data[:100]}")
-                        logger.warning(f"  Recv: {response[:100]}")
+                        logger.warning(f"Echo mismatch! Sent {len(self._last_sent_data)} bytes, received {len(response)} bytes")
+                        logger.warning(f"Sent: {self._last_sent_data[:100]}")
+                        logger.warning(f"Recv: {response[:100]}")
                 
                 return response
         except Exception as e:
