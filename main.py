@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-WebTransport Protocol Fuzzer using boofuzz and aioquic (Black-box approach)
-
-This script:
- - Sends fuzzed payloads via WebTransport bidirectional streams (aioquic)
- - Uses a custom EchoCompareMonitor to compare sent vs received (echo) data
- - Logs successes and failures via boofuzz's fuzz_data_logger
- - Saves failing testcases to failures/<timestamp>_<id>.bin
- - When a mismatch or no-response is detected the monitor returns False so boofuzz
-   can treat it as a crash/restart condition (configurable)
-"""
 
 import asyncio
 import logging
@@ -30,7 +19,6 @@ from aioquic.h3.events import (
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamDataReceived
 
-import boofuzz
 from boofuzz import Session, Target, FuzzLoggerText
 from boofuzz import s_initialize, s_get, s_string
 from boofuzz.connections import ITargetConnection
@@ -65,24 +53,6 @@ class EchoCompareMonitor(BaseMonitor):
         super().__init__()
         self.crash_on_mismatch = crash_on_mismatch
 
-    def _get_conn_from_target(self, target) -> Optional["WebTransportConnection"]:
-        """
-        Locate the underlying WebTransportConnection instance on a boofuzz Target.
-        This mirrors the helper used elsewhere in the script to be robust across versions.
-        """
-        # typical internal attribute name is _target_connection
-        candidates = [
-            getattr(target, "_target_connection", None),
-            getattr(target, "connection", None),
-            getattr(target, "_connection", None),
-            getattr(target, "target_connection", None),
-        ]
-        for c in candidates:
-            # duck-type check
-            if c and hasattr(c, "send") and hasattr(c, "recv") and hasattr(c, "url"):
-                return c  # type: ignore
-        return None
-
     def post_send(self, target, fuzz_data_logger, session, mutated_data=None, *args, **kwargs):
         """
         Called after each send. We try to compare echoed response to what was sent.
@@ -91,15 +61,15 @@ class EchoCompareMonitor(BaseMonitor):
         if it's not present we fall back to the connection's stored _last_sent_data.
         """
         try:
-            conn = self._get_conn_from_target(target)
-            if conn is None:
-                fuzz_data_logger.log_error("EchoCompareMonitor: could not access connection object")
-                # be conservative and signal failure if configured
+            # Access the connection directly from target
+            conn = target._target_connection
+            if conn is None or not isinstance(conn, WebTransportConnection):
+                fuzz_data_logger.log_error("EchoCompareMonitor: could not access WebTransportConnection")
                 return not self.crash_on_mismatch
 
             # Prefer mutated_data if boofuzz provided it; otherwise use conn buffer
-            sent = mutated_data if mutated_data is not None else getattr(conn, "_last_sent_data", None)
-            recv = getattr(conn, "_last_received_data", None)
+            sent = mutated_data if mutated_data is not None else conn._last_sent_data
+            recv = conn._last_received_data
 
             fuzz_data_logger.log_info("EchoCompareMonitor: performing post-send echo check")
 
@@ -107,12 +77,23 @@ class EchoCompareMonitor(BaseMonitor):
                 fuzz_data_logger.log_error("No sent buffer recorded for this testcase")
                 return not self.crash_on_mismatch
 
-            # Consider missing/empty recv a failure for echo tests
-            if not recv:
+            # Handle empty payload edge case: empty send should get empty echo
+            if len(sent) == 0:
+                if recv is None or len(recv) == 0:
+                    fuzz_data_logger.log_check("Echo OK: empty payload echoed correctly")
+                    return True
+                else:
+                    fuzz_data_logger.log_fail(f"Echo mismatch: sent empty but received {len(recv)} bytes")
+                    path = save_failure(sent, recv)
+                    fuzz_data_logger.log_info(f"Saved mismatch testcase to {path}")
+                    return not self.crash_on_mismatch
+
+            # For non-empty sends, missing/empty recv is a failure
+            if recv is None or len(recv) == 0:
                 fuzz_data_logger.log_fail("No response received from server (possible crash or parsing rejection)")
                 path = save_failure(sent, recv)
                 fuzz_data_logger.log_info(f"Saved failing testcase to {path}")
-                return not self.crash_on_mismatch if not self.crash_on_mismatch else False
+                return not self.crash_on_mismatch
 
             # Exact match -> pass
             if recv == sent:
@@ -128,7 +109,7 @@ class EchoCompareMonitor(BaseMonitor):
                 fuzz_data_logger.log_info(f"Sent (len={len(sent)}): {sent!r}")
                 fuzz_data_logger.log_info(f"Recv (len={len(recv)}): {recv!r}")
 
-            return not self.crash_on_mismatch if not self.crash_on_mismatch else False
+            return not self.crash_on_mismatch
 
         except Exception as e:
             fuzz_data_logger.log_error(f"Exception in EchoCompareMonitor.post_send: {e}")
@@ -150,7 +131,6 @@ class WebTransportClientProtocol(QuicConnectionProtocol):
         self._session_established = asyncio.Event()
         self._authority: Optional[str] = None
         self._bidirectional_streams: Dict[int, asyncio.Queue] = {}
-        # queue for server-initiated messages (not used heavily here)
         self._received_messages = asyncio.Queue()
 
     def quic_event_received(self, event: QuicEvent):
@@ -302,11 +282,12 @@ class WebTransportConnection(ITargetConnection):
         except Exception:
             logger.exception("Failed to open connection")
             # ensure loop closed on failure
-            try:
-                self._loop.close()
-            except Exception:
-                pass
-            self._loop = None
+            if self._loop:
+                try:
+                    self._loop.close()
+                except Exception:
+                    pass
+                self._loop = None
             raise
 
     async def _async_open(self):
@@ -337,11 +318,12 @@ class WebTransportConnection(ITargetConnection):
             except Exception:
                 logger.exception("Error during client context exit")
             finally:
-                try:
-                    self._loop.close()
-                except Exception:
-                    pass
-                self._loop = None
+                if self._loop:
+                    try:
+                        self._loop.close()
+                    except Exception:
+                        pass
+                    self._loop = None
                 self._protocol = None
 
     def send(self, data: bytes) -> int:
@@ -421,7 +403,7 @@ def main():
     echo_monitor = EchoCompareMonitor(crash_on_mismatch=True)
     target = Target(connection=connection, monitors=[echo_monitor])
 
-    # create session (note: we no longer use post_test_case_callbacks for echo checking)
+    # create session
     session = Session(
         target=target,
         fuzz_loggers=[FuzzLoggerText()],
@@ -450,4 +432,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
