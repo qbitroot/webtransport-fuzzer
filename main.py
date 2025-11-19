@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
 WebTransport Protocol Fuzzer using boofuzz and aioquic (Black-box approach)
-Simple POC targeting WebTransport echo server
+
+This script:
+ - Sends fuzzed payloads via WebTransport bidirectional streams (aioquic)
+ - Uses a custom EchoCompareMonitor to compare sent vs received (echo) data
+ - Logs successes and failures via boofuzz's fuzz_data_logger
+ - Saves failing testcases to failures/<timestamp>_<id>.bin
+ - When a mismatch or no-response is detected the monitor returns False so boofuzz
+   can treat it as a crash/restart condition (configurable)
 """
 
 import asyncio
 import logging
-from typing import Optional
+import os
+import time
+from typing import Optional, Dict, Tuple
 from urllib.parse import urlparse
 
 from aioquic.asyncio import connect
@@ -15,300 +24,430 @@ from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import (
     H3Event,
     HeadersReceived,
+    DatagramReceived,
     WebTransportStreamDataReceived,
 )
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import QuicEvent, ProtocolNegotiated
-from aioquic.quic.connection import stream_is_unidirectional
+from aioquic.quic.events import QuicEvent, StreamDataReceived
 
 import boofuzz
-from boofuzz import Session, Target
+from boofuzz import Session, Target, FuzzLoggerText
+from boofuzz import s_initialize, s_get, s_string
 from boofuzz.connections import ITargetConnection
+from boofuzz.monitors.base_monitor import BaseMonitor
+
+# ---- Logging setup ----
+LOG_FMT = "%(asctime)s [%(levelname)5s] %(name)s: %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FMT)
+logger = logging.getLogger("wt_fuzzer")
+# reduce tornado noise from boofuzz web ui
+logging.getLogger("tornado.access").setLevel(logging.WARNING)
+
+# ---- Helper: ensure failure dir exists ----
+FAILURES_DIR = "failures"
+os.makedirs(FAILURES_DIR, exist_ok=True)
 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+class EchoCompareMonitor(BaseMonitor):
+    """
+    Monitor that compares what was sent with what the target echoed back.
 
-# Suppress noisy tornado logs from boofuzz web interface
-logging.getLogger('tornado.access').setLevel(logging.WARNING)
+    It runs during the post-send phase. If a mismatch or missing response is
+    detected it logs the failure, saves the test case (sent/recv) and returns False
+    so boofuzz can treat the testcase as a crash (and optionally restart target).
+    """
+
+    def __init__(self, crash_on_mismatch: bool = True):
+        """
+        :param crash_on_mismatch: if True, the monitor returns False on mismatch/no-recv
+                                  which boofuzz treats as a failure/crash condition.
+        """
+        super().__init__()
+        self.crash_on_mismatch = crash_on_mismatch
+
+    def _get_conn_from_target(self, target) -> Optional["WebTransportConnection"]:
+        """
+        Locate the underlying WebTransportConnection instance on a boofuzz Target.
+        This mirrors the helper used elsewhere in the script to be robust across versions.
+        """
+        # typical internal attribute name is _target_connection
+        candidates = [
+            getattr(target, "_target_connection", None),
+            getattr(target, "connection", None),
+            getattr(target, "_connection", None),
+            getattr(target, "target_connection", None),
+        ]
+        for c in candidates:
+            # duck-type check
+            if c and hasattr(c, "send") and hasattr(c, "recv") and hasattr(c, "url"):
+                return c  # type: ignore
+        return None
+
+    def post_send(self, target, fuzz_data_logger, session, mutated_data=None, *args, **kwargs):
+        """
+        Called after each send. We try to compare echoed response to what was sent.
+
+        The "mutated_data" argument may or may not be provided by the boofuzz runtime;
+        if it's not present we fall back to the connection's stored _last_sent_data.
+        """
+        try:
+            conn = self._get_conn_from_target(target)
+            if conn is None:
+                fuzz_data_logger.log_error("EchoCompareMonitor: could not access connection object")
+                # be conservative and signal failure if configured
+                return not self.crash_on_mismatch
+
+            # Prefer mutated_data if boofuzz provided it; otherwise use conn buffer
+            sent = mutated_data if mutated_data is not None else getattr(conn, "_last_sent_data", None)
+            recv = getattr(conn, "_last_received_data", None)
+
+            fuzz_data_logger.log_info("EchoCompareMonitor: performing post-send echo check")
+
+            if sent is None:
+                fuzz_data_logger.log_error("No sent buffer recorded for this testcase")
+                return not self.crash_on_mismatch
+
+            # Consider missing/empty recv a failure for echo tests
+            if not recv:
+                fuzz_data_logger.log_fail("No response received from server (possible crash or parsing rejection)")
+                path = save_failure(sent, recv)
+                fuzz_data_logger.log_info(f"Saved failing testcase to {path}")
+                return not self.crash_on_mismatch if not self.crash_on_mismatch else False
+
+            # Exact match -> pass
+            if recv == sent:
+                fuzz_data_logger.log_check("Echo OK: response matches sent data")
+                return True
+
+            # Mismatch: save and log details
+            fuzz_data_logger.log_fail("Echo mismatch: received content differs from sent payload")
+            path = save_failure(sent, recv)
+            fuzz_data_logger.log_info(f"Saved mismatch testcase to {path}")
+
+            if len(sent) < 256 and len(recv) < 256:
+                fuzz_data_logger.log_info(f"Sent (len={len(sent)}): {sent!r}")
+                fuzz_data_logger.log_info(f"Recv (len={len(recv)}): {recv!r}")
+
+            return not self.crash_on_mismatch if not self.crash_on_mismatch else False
+
+        except Exception as e:
+            fuzz_data_logger.log_error(f"Exception in EchoCompareMonitor.post_send: {e}")
+            logger.exception("EchoCompareMonitor exception")
+            return not self.crash_on_mismatch
 
 
 class WebTransportClientProtocol(QuicConnectionProtocol):
     """
     Black-box WebTransport client protocol handler.
     Handles HTTP/3 connection and WebTransport session establishment.
+    Minimal event handling to capture stream/datagram data for the fuzzer.
     """
-    
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._http = None
-        self._session_id = None
+        self._http: Optional[H3Connection] = None
+        self._session_id: Optional[int] = None
         self._session_established = asyncio.Event()
-        self._received_data = {}
-        self._authority = None
-        self._path = None
-        
+        self._authority: Optional[str] = None
+        self._bidirectional_streams: Dict[int, asyncio.Queue] = {}
+        # queue for server-initiated messages (not used heavily here)
+        self._received_messages = asyncio.Queue()
+
     def quic_event_received(self, event: QuicEvent):
-        """Handle QUIC events."""
-        if isinstance(event, ProtocolNegotiated):
+        # Lazily create H3 connection wrapper
+        if self._http is None:
             self._http = H3Connection(self._quic, enable_webtransport=True)
-        
-        if self._http is not None:
-            for h3_event in self._http.handle_event(event):
-                self._h3_event_received(h3_event)
-    
-    def _h3_event_received(self, event: H3Event):
-        """Handle HTTP/3 events."""
+
+        # Handle QUIC-level stream data (client-initiated streams we track)
+        if isinstance(event, StreamDataReceived):
+            qsid = event.stream_id
+            if qsid in self._bidirectional_streams:
+                self._bidirectional_streams[qsid].put_nowait(('data', event.data))
+                if event.end_stream:
+                    self._bidirectional_streams[qsid].put_nowait(('end', None))
+
+        # Translate to H3 events and handle them
+        for h3_event in self._http.handle_event(event):
+            self._handle_h3_event(h3_event)
+
+    def _handle_h3_event(self, event: H3Event):
         if isinstance(event, HeadersReceived):
-            headers = dict(event.headers)
-            status = headers.get(b":status", b"")
-            
+            # Check for CONNECT (WebTransport) response success (200)
+            headers_dict = dict(event.headers)
+            status = headers_dict.get(b":status", b"")
             if status == b"200":
-                logger.info(f"WebTransport session established (stream {event.stream_id})")
+                # the HTTP3 stream_id for the CONNECT indicates the session
                 self._session_id = event.stream_id
                 self._session_established.set()
+                logger.info("WebTransport session established (stream %d)", event.stream_id)
             else:
-                logger.error(f"WebTransport handshake failed: {status}")
-                logger.error(f"Headers: {headers}")
-                
+                logger.error(
+                    "WebTransport CONNECT failed: status=%s headers=%s",
+                    status.decode(errors="ignore"),
+                    headers_dict,
+                )
+
+        elif isinstance(event, DatagramReceived):
+            self._received_messages.put_nowait(('datagram', event.data))
+
         elif isinstance(event, WebTransportStreamDataReceived):
-            logger.debug(f"Received {len(event.data)} bytes on stream {event.stream_id}")
-            if event.stream_id not in self._received_data:
-                self._received_data[event.stream_id] = b""
-            self._received_data[event.stream_id] += event.data
-    
-    async def establish_session(self, authority: str, path: str):
-        """Establish WebTransport session via HTTP/3 CONNECT."""
+            # Server-initiated WebTransport stream data
+            self._received_messages.put_nowait(('stream', event.stream_id, event.data))
+            if event.stream_ended:
+                logger.debug("Server closed stream %d", event.stream_id)
+
+    async def establish_session(self, authority: str, path: str = "/echo"):
+        """Send the CONNECT: webtransport request and wait for 200."""
         self._authority = authority
-        self._path = path
-        
-        # Get a stream ID for the CONNECT request
+        # pick a new client-initiated stream id
         stream_id = self._quic.get_next_available_stream_id()
-        
-        # Send CONNECT request
         headers = [
             (b":method", b"CONNECT"),
             (b":scheme", b"https"),
             (b":authority", authority.encode()),
             (b":path", path.encode()),
             (b":protocol", b"webtransport"),
-            (b"sec-webtransport-http3-draft", b"draft-ietf-webtrans-http3-14"),
+            (b"sec-webtransport-http3-draft", b"draft02"),
         ]
-        
-        self._http.send_headers(stream_id=stream_id, headers=headers)
+        logger.info("Sending CONNECT for WebTransport to %s%s", authority, path)
+        # send headers and flush
+        self._http.send_headers(stream_id, headers)
         self.transmit()
-        
-        # Wait for session establishment
-        try:
-            await asyncio.wait_for(self._session_established.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            raise RuntimeError("WebTransport session establishment timeout")
-    
-    def send_stream_data(self, data: bytes):
-        """Send data on a bidirectional WebTransport stream."""
-        if self._session_id is None or not self._http:
-            raise RuntimeError("Session not established")
-        
-        # Create new bidirectional stream
+        # wait for session establishment
+        await asyncio.wait_for(self._session_established.wait(), timeout=5.0)
+
+    async def send_bidirectional_stream(self, data: bytes, timeout: float = 3.0) -> Tuple[int, Optional[bytes]]:
+        """
+        Create a WebTransport bidirectional stream, send data, wait for response.
+        Returns (stream_id, response_bytes_or_None).
+        """
+        if self._session_id is None:
+            raise RuntimeError("WebTransport session not established")
+
+        # create a new webtransport stream via h3 wrapper
         stream_id = self._http.create_webtransport_stream(
-            self._session_id,
-            is_unidirectional=False
+            session_id=self._session_id,
+            is_unidirectional=False,
         )
-        
-        # Send data
-        self._http._quic.send_stream_data(stream_id, data, end_stream=True)
+
+        # create a queue to receive data events for this stream
+        response_q: asyncio.Queue = asyncio.Queue()
+        self._bidirectional_streams[stream_id] = response_q
+
+        # write and close the write side
+        self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=True)
         self.transmit()
-        
-        return stream_id
-    
-    def get_received_data(self):
-        """Get all received data and clear buffer."""
-        data = self._received_data.copy()
-        self._received_data.clear()
-        return data
+
+        try:
+            # first event may be data or end
+            event_type, payload = await asyncio.wait_for(response_q.get(), timeout=timeout)
+            if event_type == 'data':
+                # optionally wait a short time for end marker
+                try:
+                    end_event = await asyncio.wait_for(response_q.get(), timeout=1.0)
+                    if end_event[0] == 'end':
+                        pass
+                except asyncio.TimeoutError:
+                    pass
+                return stream_id, payload
+            elif event_type == 'end':
+                return stream_id, None
+            else:
+                return stream_id, None
+        except asyncio.TimeoutError:
+            logger.debug("Timeout waiting for response on stream %d", stream_id)
+            return stream_id, None
+        finally:
+            # cleanup
+            self._bidirectional_streams.pop(stream_id, None)
 
 
 class WebTransportConnection(ITargetConnection):
     """
-    Black-box boofuzz connection for WebTransport.
+    boofuzz ITargetConnection implementation using aioquic WebTransport streams.
+
+    It stores last sent/received data on the object, so the monitor
+    can inspect and compare them.
     """
-    
+
     def __init__(self, url: str, timeout: float = 3.0):
         self.url = url
         self.timeout = timeout
-        self._protocol = None
-        self._loop = None
+        self._protocol: Optional[WebTransportClientProtocol] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._client_context = None
-        self._last_sent_data = None
-        
-        # Parse URL
+        self._last_sent_data: Optional[bytes] = None
+        self._last_received_data: Optional[bytes] = None
+
         parsed = urlparse(url)
         self.host = parsed.hostname
         self.port = parsed.port or 443
         self.path = parsed.path or "/"
         self.authority = f"{self.host}:{self.port}"
-        
-        logger.info(f"Initialized fuzzer for {url}")
-    
+
+        logger.info("WebTransportConnection initialized for %s", url)
+
     @property
     def info(self) -> str:
         return f"WebTransport({self.url})"
-    
+
     def open(self):
-        """Open WebTransport connection."""
-        logger.info(f"Connecting to {self.host}:{self.port}{self.path}")
-        
+        """Establish QUIC/H3/WebTransport session (blocking for boofuzz)."""
+        logger.info("Opening WebTransport connection to %s", self.url)
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        
         try:
             self._loop.run_until_complete(self._async_open())
-            logger.info("Connection established")
-        except Exception as e:
-            logger.error(f"Connection failed: {e}")
+            logger.info("Connection open")
+        except Exception:
+            logger.exception("Failed to open connection")
+            # ensure loop closed on failure
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+            self._loop = None
             raise
-    
+
     async def _async_open(self):
-        """Async connection establishment."""
-        configuration = QuicConfiguration(
+        config = QuicConfiguration(
             alpn_protocols=H3_ALPN,
             is_client=True,
-            verify_mode=False,  # Disable cert verification for testing
-            max_datagram_frame_size=65536,  # Enable datagram support
+            verify_mode=False,  # testing: skip cert verification
+            max_datagram_frame_size=65536,
         )
-        
-        # Connect
         self._client_context = connect(
             self.host,
             self.port,
-            configuration=configuration,
+            configuration=config,
             create_protocol=WebTransportClientProtocol,
         )
-        
+        # enter context to get the protocol instance
         self._protocol = await self._client_context.__aenter__()
-        
-        # Establish WebTransport session
+
+        # establish webtransport session (CONNECT)
         await self._protocol.establish_session(self.authority, self.path)
-    
+
     def close(self):
-        """Close connection."""
-        logger.info("Closing connection")
-        
+        """Close session and loop cleanly."""
+        logger.info("Closing WebTransport connection")
         if self._loop and self._client_context:
             try:
-                self._loop.run_until_complete(
-                    self._client_context.__aexit__(None, None, None)
-                )
-            except Exception as e:
-                logger.debug(f"Close error: {e}")
+                self._loop.run_until_complete(self._client_context.__aexit__(None, None, None))
+            except Exception:
+                logger.exception("Error during client context exit")
             finally:
-                self._loop.close()
+                try:
+                    self._loop.close()
+                except Exception:
+                    pass
                 self._loop = None
                 self._protocol = None
-    
+
     def send(self, data: bytes) -> int:
-        """Send fuzzed data."""
+        """Send fuzzed data via a new bidirectional stream and store last_* buffers."""
         if not self._loop or not self._protocol:
             raise RuntimeError("Connection not open")
-        
-        logger.debug(f"Sending {len(data)} bytes")
-        
+
+        logger.debug("Sending %d bytes (preview: %s)", len(data), data[:100])
+        self._last_sent_data = data
+        self._last_received_data = None
+
         try:
-            self._last_sent_data = data
-            self._protocol.send_stream_data(data)
+            stream_id, response = self._loop.run_until_complete(
+                self._protocol.send_bidirectional_stream(data, timeout=self.timeout)
+            )
+            self._last_received_data = response
+            if response is not None:
+                logger.debug("Received %d bytes on stream %d", len(response), stream_id)
+            else:
+                logger.debug("No response received for stream %d", stream_id)
+            # boofuzz expects send() to return number of bytes sent
             return len(data)
-        except Exception as e:
-            logger.error(f"Send failed: {e}")
+        except Exception:
+            logger.exception("Exception during send")
             raise
-    
+
     def recv(self, max_bytes: int) -> bytes:
-        """Receive response data."""
-        if not self._loop or not self._protocol:
-            return b""
-        
-        try:
-            # Give server time to respond
-            self._loop.run_until_complete(asyncio.sleep(self.timeout))
-            
-            # Get received data
-            received = self._protocol.get_received_data()
-            if received:
-                all_data = b"".join(received.values())
-                response = all_data[:max_bytes]
-                
-                # Check if echo response matches what we sent
-                if self._last_sent_data is not None:
-                    if response == self._last_sent_data:
-                        logger.info("Echo response matches sent data")
-                    else:
-                        logger.warning(f"Echo mismatch! Sent {len(self._last_sent_data)} bytes, received {len(response)} bytes")
-                        logger.warning(f"Sent: {self._last_sent_data[:100]}")
-                        logger.warning(f"Recv: {response[:100]}")
-                
-                return response
-        except Exception as e:
-            logger.debug(f"Recv error: {e}")
-        
+        """Return previously stored response (up to max_bytes)."""
+        if self._last_received_data:
+            return self._last_received_data[:max_bytes]
         return b""
 
 
+# ---- Utilities used by the monitor ----
+def save_failure(sent: Optional[bytes], recv: Optional[bytes]) -> str:
+    """Save sent/recv pair to a timestamped file; return path."""
+    ts = int(time.time() * 1000)
+    fname = os.path.join(FAILURES_DIR, f"failure_{ts}.bin")
+    with open(fname, "wb") as f:
+        # write a small header to aid analysis
+        f.write(b"---SENT---\n")
+        f.write(sent or b"")
+        f.write(b"\n---RECV---\n")
+        f.write(recv or b"")
+    return fname
+
+
+# ---- Protocol definition for boofuzz ----
 def define_protocol():
-    """Define the protocol message for fuzzing."""
-    boofuzz.s_initialize("webtransport_echo")
-    
-    # Simple fuzzable text message
-    boofuzz.s_string("Hello, WebTransport!", name="message", fuzzable=True)
-    
-    return boofuzz.s_get("webtransport_echo")
+    # Using boofuzz's API to define a simple fuzzable string field
+    s_initialize("webtransport_echo")
+    s_string("Hello, WebTransport!", fuzzable=True)
+    return s_get("webtransport_echo")
 
 
+# ---- Main entrypoint ----
 def main():
-    """Main fuzzer entry point."""
-    # CORRECTED URL with port 6161
-    target_url = "https://wt-ord.akaleapi.net:6161/echo"
-    
-    print("""
+    target_url = "https://wt-ord.akaleapi.net:6161/echo"  # customize as needed
+
+    print(
+        """
 ╔═══════════════════════════════════════════════════════╗
 ║   WebTransport Black-Box Fuzzer - PoC                 ║
 ║   Using: boofuzz + aioquic                            ║
+║   Transport: Bidirectional WebTransport Streams       ║
 ╚═══════════════════════════════════════════════════════╝
-    """)
-    
-    logger.info(f"Target: {target_url}")
-    
-    # Create connection
-    connection = WebTransportConnection(target_url, timeout=2.0)
-    
-    # Create target
-    target = Target(connection=connection)
-    
-    # Create session
+    """
+    )
+    logger.info("Target: %s", target_url)
+
+    # create connection and target
+    connection = WebTransportConnection(target_url, timeout=3.0)
+
+    # Attach our EchoCompareMonitor to the Target's monitors list.
+    # crash_on_mismatch=True makes the monitor return False on mismatch/no-response,
+    # which boofuzz will treat as a failure (and may restart the target).
+    echo_monitor = EchoCompareMonitor(crash_on_mismatch=True)
+    target = Target(connection=connection, monitors=[echo_monitor])
+
+    # create session (note: we no longer use post_test_case_callbacks for echo checking)
     session = Session(
         target=target,
-        fuzz_loggers=[boofuzz.FuzzLoggerText()],
+        fuzz_loggers=[FuzzLoggerText()],
         sleep_time=1.0,
         restart_sleep_time=2.0,
-        reuse_target_connection=False,  # New connection each test
+        reuse_target_connection=False,
     )
-    
-    # Define protocol
-    message = define_protocol()
-    session.connect(message)
-    
-    # Start fuzzing
-    logger.info("Starting fuzzing...")
-    logger.info("Web UI: http://localhost:26000")
+
+    # build protocol model
+    msg = define_protocol()
+    session.connect(msg)
+
+    logger.info("Starting fuzzing session")
+    logger.info("Web UI available at: http://localhost:26000 (if enabled)")
     logger.info("Press Ctrl+C to stop")
-    
+
     try:
         session.fuzz()
     except KeyboardInterrupt:
-        logger.info("\nStopped by user")
-    except Exception as e:
-        logger.error(f"Fuzzing error: {e}", exc_info=True)
+        logger.info("Fuzzing stopped by user")
+    except Exception:
+        logger.exception("Fuzzing encountered an error")
     finally:
-        logger.info("Session complete")
+        logger.info("Fuzzing session finished")
 
 
 if __name__ == "__main__":
     main()
+
