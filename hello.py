@@ -11,201 +11,18 @@ This client connects to a WebTransport server and demonstrates:
 import argparse
 import asyncio
 import logging
-from typing import Optional, Dict
 
 from aioquic.asyncio import connect
-from aioquic.asyncio.protocol import QuicConnectionProtocol
-from aioquic.h3.connection import H3_ALPN, H3Connection
-from aioquic.h3.events import (
-    DatagramReceived,
-    DataReceived,
-    HeadersReceived,
-    WebTransportStreamDataReceived,
-    H3Event,
-)
+from aioquic.h3.connection import H3_ALPN
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import QuicEvent, StreamDataReceived
+
+from src.webtransport_client import WebTransportClient
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-
-class WebTransportClient(QuicConnectionProtocol):
-    """
-    WebTransport client protocol handler.
-    Manages WebTransport session over HTTP/3.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._http: Optional[H3Connection] = None
-        self._session_id: Optional[int] = None
-        self._session_established = asyncio.Event()
-        self._received_messages = asyncio.Queue()
-        self._authority: Optional[str] = None
-        self._bidirectional_streams: Dict[int, asyncio.Queue] = {}
-
-    def quic_event_received(self, event: QuicEvent):
-        """Handle QUIC events and pass them to H3Connection."""
-        # Handle bidirectional stream data directly at QUIC level
-        # because aioquic doesn't generate WebTransportStreamDataReceived for client-initiated streams
-        if isinstance(event, StreamDataReceived):
-            if event.stream_id in self._bidirectional_streams:
-                logger.debug("Received data on tracked bidirectional stream %d", event.stream_id)
-                message = event.data.decode('utf-8', errors='ignore')
-                logger.info("📨 Stream data received (stream %d): %s", event.stream_id, message)
-                self._bidirectional_streams[event.stream_id].put_nowait(('data', message))
-                
-                if event.end_stream:
-                    logger.info("Stream %d closed by server", event.stream_id)
-                    self._bidirectional_streams[event.stream_id].put_nowait(('end', None))
-        
-        if self._http is None:
-            self._http = H3Connection(self._quic, enable_webtransport=True)
-
-        for h3_event in self._http.handle_event(event):
-            self._handle_h3_event(h3_event)
-
-    def _handle_h3_event(self, event: H3Event):
-        """Handle HTTP/3 events."""
-        if isinstance(event, HeadersReceived):
-            # Check if this is the WebTransport session response
-            headers_dict = dict(event.headers)
-            status = headers_dict.get(b":status", b"")
-            
-            if status == b"200":
-                logger.info("WebTransport session established (stream %d)", event.stream_id)
-                self._session_id = event.stream_id
-                self._session_established.set()
-            else:
-                logger.error("WebTransport session failed with status: %s", status.decode())
-                logger.error("Headers: %s", headers_dict)
-
-        elif isinstance(event, DatagramReceived):
-            # Received a datagram from the server
-            message = event.data.decode('utf-8', errors='ignore')
-            logger.info("📨 Datagram received: %s", message)
-            self._received_messages.put_nowait(('datagram', message))
-
-        elif isinstance(event, WebTransportStreamDataReceived):
-            # Received data on a WebTransport stream (server-initiated)
-            message = event.data.decode('utf-8', errors='ignore')
-            logger.info("📨 Stream data received (stream %d): %s", event.stream_id, message)
-            self._received_messages.put_nowait(('stream', event.stream_id, message))
-
-            if event.stream_ended:
-                logger.info("Stream %d closed by server", event.stream_id)
-
-        elif isinstance(event, DataReceived):
-            # Regular HTTP/3 data (not WebTransport stream)
-            pass
-
-    async def establish_session(self, authority: str, path: str = "/echo"):
-        """Establish a WebTransport session."""
-        self._authority = authority
-        
-        # Create a new bidirectional stream for the CONNECT request
-        stream_id = self._quic.get_next_available_stream_id()
-        
-        headers = [
-            (b":method", b"CONNECT"),
-            (b":scheme", b"https"),
-            (b":authority", authority.encode()),
-            (b":path", path.encode()),
-            (b":protocol", b"webtransport"),
-            (b"sec-webtransport-http3-draft", b"draft02"),
-        ]
-        
-        logger.info("Establishing WebTransport session to %s%s", authority, path)
-        self._http.send_headers(stream_id, headers)
-        self.transmit()
-        
-        # Wait for session to be established
-        await asyncio.wait_for(self._session_established.wait(), timeout=5.0)
-        logger.info("✅ WebTransport session ready")
-
-    def send_datagram(self, data: bytes):
-        """Send a datagram over WebTransport."""
-        if self._session_id is None:
-            raise RuntimeError("WebTransport session not established")
-        
-        # According to aioquic docs, send_datagram takes stream_id and data
-        self._http.send_datagram(stream_id=self._session_id, data=data)
-        self.transmit()
-        logger.info("📤 Sent datagram: %s", data.decode('utf-8', errors='ignore'))
-
-    async def send_unidirectional_stream(self, data: bytes):
-        """Send data on a unidirectional WebTransport stream."""
-        if self._session_id is None:
-            raise RuntimeError("WebTransport session not established")
-        
-        # Create a WebTransport stream
-        stream_id = self._http.create_webtransport_stream(
-            session_id=self._session_id,
-            is_unidirectional=True
-        )
-        
-        # Write directly to the QUIC stream
-        self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=True)
-        self.transmit()
-        logger.info("📤 Sent unidirectional stream (stream %d): %s", 
-                   stream_id, data.decode('utf-8', errors='ignore'))
-
-    async def send_bidirectional_stream(self, data: bytes, timeout: float = 5.0):
-        """Send data on a bidirectional WebTransport stream and wait for response."""
-        if self._session_id is None:
-            raise RuntimeError("WebTransport session not established")
-        
-        # Create a WebTransport stream
-        stream_id = self._http.create_webtransport_stream(
-            session_id=self._session_id,
-            is_unidirectional=False
-        )
-        
-        # Create a queue to receive responses for this stream BEFORE sending data
-        response_queue = asyncio.Queue()
-        self._bidirectional_streams[stream_id] = response_queue
-        
-        logger.info("Opened bidirectional stream #%d with data: %s", 
-                   stream_id, data.decode('utf-8', errors='ignore'))
-        
-        try:
-            # Write data and close the write side (matching JS: await writer.close())
-            self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=True)
-            self.transmit()
-            
-            # Wait for response data
-            event_type, response = await asyncio.wait_for(response_queue.get(), timeout=timeout)
-            
-            if event_type == 'data' and response:
-                logger.info("✅ Bidirectional stream %d response received: %s", stream_id, response)
-                
-                # Wait for stream end
-                try:
-                    end_event = await asyncio.wait_for(response_queue.get(), timeout=1.0)
-                    if end_event[0] == 'end':
-                        logger.debug("Bidirectional stream %d ended", stream_id)
-                except asyncio.TimeoutError:
-                    logger.debug("No explicit end event for stream %d", stream_id)
-                
-                return stream_id, response
-            elif event_type == 'end':
-                logger.info("✅ Bidirectional stream %d completed (stream ended without data)", stream_id)
-                return stream_id, None
-            else:
-                logger.warning("⚠️  Unexpected event on bidirectional stream %d", stream_id)
-                return stream_id, None
-            
-        except asyncio.TimeoutError:
-            logger.warning("⚠️  Timeout waiting for response on bidirectional stream %d", stream_id)
-            return stream_id, None
-        finally:
-            # Clean up the stream tracking
-            if stream_id in self._bidirectional_streams:
-                del self._bidirectional_streams[stream_id]
 
 
 async def interactive_mode(client: WebTransportClient):
@@ -244,14 +61,18 @@ async def interactive_mode(client: WebTransportClient):
             
             if cmd_type == 'd':
                 client.send_datagram(data)
+                logger.info("Sent datagram: %s", message)
             elif cmd_type == 'u':
                 await client.send_unidirectional_stream(data)
+                logger.info("Sent unidirectional stream: %s", message)
             elif cmd_type == 'b':
-                await client.send_bidirectional_stream(data)
+                stream_id, response = await client.send_bidirectional_stream(data)
+                logger.info("Sent bidirectional stream: %s", message)
+                if response:
+                    logger.info("Received response: %s", response.decode('utf-8', errors='ignore'))
             else:
                 print(f"Unknown command: {cmd_type}")
             
-            # Small delay to see responses
             await asyncio.sleep(0.1)
             
         except EOFError:
@@ -278,7 +99,9 @@ async def demo_mode(client: WebTransportClient):
     
     # Test 3: Send bidirectional stream
     logger.info("\nTest 3: Sending bidirectional stream...")
-    await client.send_bidirectional_stream(b"Hello via bidirectional stream!")
+    stream_id, response = await client.send_bidirectional_stream(b"Hello via bidirectional stream!")
+    if response:
+        logger.info("Received response: %s", response.decode('utf-8', errors='ignore'))
     await asyncio.sleep(0.5)
     
     # Test 4: Multiple datagrams
@@ -304,39 +127,33 @@ async def main():
                        help="Run in interactive mode")
     args = parser.parse_args()
 
-    # Configure QUIC with datagram support
     config = QuicConfiguration(
         is_client=True,
         alpn_protocols=H3_ALPN,
-        max_datagram_frame_size=65536,  # Enable datagram support (required for WebTransport)
+        max_datagram_frame_size=65536,
     )
     
     if args.insecure:
         config.verify_mode = False
         logger.warning("Certificate verification disabled (insecure mode)")
 
-    # Build authority string (host:port)
     authority = f"{args.host}:{args.port}"
     
     logger.info("Connecting to https://%s%s", authority, args.path)
 
-    # Connect to server
     async with connect(
         args.host,
         args.port,
         configuration=config,
         create_protocol=WebTransportClient,
     ) as client:
-        # Establish WebTransport session
         await client.establish_session(authority, args.path)
         
-        # Run in interactive or demo mode
         if args.interactive:
             await interactive_mode(client)
         else:
             await demo_mode(client)
         
-        # Give time for final responses
         await asyncio.sleep(0.5)
 
 
