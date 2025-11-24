@@ -15,12 +15,13 @@
 # limitations under the License.
 """
 An example WebTransport over HTTP/3 server based on the aioquic library.
-Processes incoming streams and datagrams, and
-replies with the ASCII-encoded length of the data sent in bytes.
+Processes incoming streams and datagrams, and echoes back the data received.
+
 Example use:
-  python3 webtransport_server.py certificate.pem certificate.key
+  python3 server.py certificate.pem certificate.key
+
 Example use from JavaScript:
-  let transport = new WebTransport("https://localhost:4433/counter");
+  let transport = new WebTransport("https://localhost:6161/echo");
   await transport.ready;
   let stream = await transport.createBidirectionalStream();
   let encoder = new TextEncoder();
@@ -28,7 +29,8 @@ Example use from JavaScript:
   await writer.write(encoder.encode("Hello, world!"))
   writer.close();
   console.log(await new Response(stream.readable).text());
-This will output "13" (the length of "Hello, world!") into the console.
+
+This will output "Hello, world!" (echoed back) into the console.
 """
 
 # ---- Dependencies ----
@@ -64,8 +66,8 @@ This will output "13" (the length of "Hello, world!") into the console.
 #
 #   3. Pass a flag to Chromium indicating what host and port should be allowed
 #      to use the self-signed certificate.  For instance, if the host is
-#      localhost, and the port is 4433, the flag would be:
-#         --origin-to-force-quic-on=localhost:4433
+#      localhost, and the port is 6161, the flag would be:
+#         --origin-to-force-quic-on=localhost:6161
 #
 #   4. Pass a flag to Chromium indicating which certificate needs to be trusted.
 #      For the example above, that flag would be:
@@ -90,24 +92,18 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import stream_is_unidirectional
 from aioquic.quic.events import ProtocolNegotiated, StreamReset, QuicEvent
 
-#BIND_ADDRESS = '::1'
-#BIND_PORT = 4433
-
 BIND_ADDRESS = '0.0.0.0'
 BIND_PORT = 6161
 
 logger = logging.getLogger(__name__)
 
-# CounterHandler implements a really simple protocol:
-#   - For every incoming bidirectional stream, it counts bytes it receives on
-#     that stream until the stream is closed, and then replies with that byte
-#     count on the same stream.
-#   - For every incoming unidirectional stream, it counts bytes it receives on
-#     that stream until the stream is closed, and then replies with that byte
-#     count on a new unidirectional stream.
-#   - For every incoming datagram, it sends a datagram with the length of
-#     datagram that was just received.
-class CounterHandler:
+# EchoHandler implements a simple echo protocol:
+#   - For every incoming bidirectional stream, it echoes back all received data
+#     on the same stream once the stream is closed.
+#   - For every incoming unidirectional stream, it echoes back all received data
+#     on a new unidirectional stream once the original stream is closed.
+#   - For every incoming datagram, it echoes back the datagram immediately.
+class EchoHandler:
 
     def __init__(self, session_id, http: H3Connection) -> None:
         self._session_id = session_id
@@ -117,10 +113,12 @@ class CounterHandler:
     def h3_event_received(self, event: H3Event) -> None:
         if isinstance(event, DatagramReceived):
             payload = event.data
+            logger.info("Received datagram (%d bytes), echoing back", len(payload))
             self._http.send_datagram(self._session_id, payload)
 
         if isinstance(event, WebTransportStreamDataReceived):
             self._payloads[event.stream_id] += event.data
+            logger.info("Received stream data on stream %d: %d bytes", event.stream_id, len(event.data))
             if event.stream_ended:
                 if stream_is_unidirectional(event.stream_id):
                     response_id = self._http.create_webtransport_stream(
@@ -128,6 +126,7 @@ class CounterHandler:
                 else:
                     response_id = event.stream_id
                 payload = self._payloads[event.stream_id]
+                logger.info("Echoing back %d bytes on stream %d", len(payload), response_id)
                 self._http._quic.send_stream_data(
                     response_id, payload, end_stream=True)
                 self.stream_closed(event.stream_id)
@@ -140,14 +139,14 @@ class CounterHandler:
 
 
 # WebTransportProtocol handles the beginning of a WebTransport connection: it
-# responses to an extended CONNECT method request, and routes the transport
-# events to a relevant handler (in this example, CounterHandler).
+# responds to an extended CONNECT method request, and routes the transport
+# events to a relevant handler (in this example, EchoHandler).
 class WebTransportProtocol(QuicConnectionProtocol):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._http: Optional[H3Connection] = None
-        self._handler: Optional[CounterHandler] = None
+        self._handler: Optional[EchoHandler] = None
 
     def quic_event_received(self, event: QuicEvent) -> None:
         if isinstance(event, ProtocolNegotiated):
@@ -187,7 +186,7 @@ class WebTransportProtocol(QuicConnectionProtocol):
             return
         if path == b"/echo":
             assert(self._handler is None)
-            self._handler = CounterHandler(stream_id, self._http)
+            self._handler = EchoHandler(stream_id, self._http)
             self._send_response(stream_id, 200)
         else:
             self._send_response(stream_id, 404, end_stream=True)
