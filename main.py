@@ -28,7 +28,7 @@ def define_protocol():
 
 
 def main():
-    target_url = "https://wt-ord.akaleapi.net:6161/echo"
+    target_url = "https://0.0.0.0:6161/echo"
 
     print(
         """

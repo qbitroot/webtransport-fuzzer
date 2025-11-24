@@ -77,6 +77,9 @@ This will output "13" (the length of "Hello, world!") into the console.
 import argparse
 import asyncio
 import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 from collections import defaultdict
 from typing import Dict, Optional
 
@@ -87,10 +90,12 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import stream_is_unidirectional
 from aioquic.quic.events import ProtocolNegotiated, StreamReset, QuicEvent
 
-BIND_ADDRESS = '::1'
-BIND_PORT = 4433
+#BIND_ADDRESS = '::1'
+#BIND_PORT = 4433
 
-logging.basicConfig(level=logging.INFO)
+BIND_ADDRESS = '0.0.0.0'
+BIND_PORT = 6161
+
 logger = logging.getLogger(__name__)
 
 # CounterHandler implements a really simple protocol:
@@ -107,29 +112,29 @@ class CounterHandler:
     def __init__(self, session_id, http: H3Connection) -> None:
         self._session_id = session_id
         self._http = http
-        self._counters = defaultdict(int)
+        self._payloads = defaultdict(bytearray)
 
     def h3_event_received(self, event: H3Event) -> None:
         if isinstance(event, DatagramReceived):
-            payload = str(len(event.data)).encode('ascii')
+            payload = event.data
             self._http.send_datagram(self._session_id, payload)
 
         if isinstance(event, WebTransportStreamDataReceived):
-            self._counters[event.stream_id] += len(event.data)
+            self._payloads[event.stream_id] += event.data
             if event.stream_ended:
                 if stream_is_unidirectional(event.stream_id):
                     response_id = self._http.create_webtransport_stream(
                         self._session_id, is_unidirectional=True)
                 else:
                     response_id = event.stream_id
-                payload = str(self._counters[event.stream_id]).encode('ascii')
+                payload = self._payloads[event.stream_id]
                 self._http._quic.send_stream_data(
                     response_id, payload, end_stream=True)
                 self.stream_closed(event.stream_id)
 
     def stream_closed(self, stream_id: int) -> None:
         try:
-            del self._counters[stream_id]
+            del self._payloads[stream_id]
         except KeyError:
             pass
 
@@ -180,7 +185,7 @@ class WebTransportProtocol(QuicConnectionProtocol):
             # `:authority` and `:path` must be provided.
             self._send_response(stream_id, 400, end_stream=True)
             return
-        if path == b"/counter":
+        if path == b"/echo":
             assert(self._handler is None)
             self._handler = CounterHandler(stream_id, self._http)
             self._send_response(stream_id, 200)
