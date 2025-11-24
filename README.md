@@ -7,4 +7,4 @@ Boofuzz-based WebTransport protocol fuzzer.
 
 ## Current progress
 
-[![asciicast](https://asciinema.org/a/XmmS2X5sKZLhcdgHuI1zP4n3s.svg)](https://asciinema.org/a/XmmS2X5sKZLhcdgHuI1zP4n3s)
+[![asciicast](https://asciinema.org/a/WYtY0LEHRUk9pH29YYNTZSugk.svg)](https://asciinema.org/a/WYtY0LEHRUk9pH29YYNTZSugk)
