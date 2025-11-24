@@ -2,8 +2,7 @@
 
 Boofuzz-based WebTransport protocol fuzzer.
 
-- Testing against: https://wt-ord.akaleapi.net/echo/
-- WebTransport Server URL: https://wt-ord.akaleapi.net:6161/echo
+Tested against a local server (see server directory), based on [w3c/webtransport ipv4_echo_server.py](https://github.com/w3c/webtransport/blob/main/samples/echo/py-server/ipv4_echo_server.py).
 
 ## Current progress
 
