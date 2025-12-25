@@ -168,3 +168,18 @@ class WebTransportClient(QuicConnectionProtocol):
         finally:
             if stream_id in self._bidirectional_streams:
                 del self._bidirectional_streams[stream_id]
+
+    def create_raw_stream(self, is_unidirectional: bool = True) -> int:
+        """
+        Create a QUIC stream ID without H3/WebTransport tracking.
+        Used for fuzzing to inject raw frames.
+        """
+        return self._quic.get_next_available_stream_id(is_unidirectional=is_unidirectional)
+
+    def send_raw_stream(self, stream_id: int, data: bytes, end_stream: bool = False):
+        """
+        Send raw bytes on a QUIC stream, bypassing H3 framing.
+        """
+        self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=end_stream)
+        self.transmit()
+        logger.debug("Sent raw stream (stream %d): %d bytes", stream_id, len(data))

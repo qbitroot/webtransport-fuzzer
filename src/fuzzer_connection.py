@@ -97,31 +97,99 @@ class WebTransportConnection(ITargetConnection):
                     self._loop = None
                 self._protocol = None
 
+    @property
+    def session_id(self) -> Optional[int]:
+        if self._protocol:
+            return self._protocol._session_id
+        return None
+
     def send(self, data: bytes) -> int:
-        """Send fuzzed data via a new bidirectional stream and store last_* buffers."""
+        """
+        Send fuzzed data via a new raw unidirectional stream.
+        This assumes 'data' contains the HTTP/3 Stream Type + Session ID + Payload.
+        """
         if not self._loop or not self._protocol:
             raise RuntimeError("Connection not open")
 
-        logger.debug("Sending %d bytes (preview: %s)", len(data), data[:100])
+        # Dynamic Session ID Replacement
+        # The Boofuzz definition uses \xAA as a placeholder for the Session ID.
+        # Use position-based check: [StreamType(2)] [SessionID(1)] ...
+        # StreamType is now 2 bytes (\x40\x54).
+        if len(data) >= 3 and data[2] == 0xAA:
+            session_id = self.session_id
+            if session_id is not None:
+                # Simple VarInt encoding for small IDs (typical in simple tests)
+                # For robust fuzzing of larger IDs, we'd need full varint logic.
+                if session_id < 64:
+                    encoded_id = bytes([session_id])
+                    # Reconstruct data: [StreamType(2)] + [RealID] + [Rest]
+                    data = data[:2] + encoded_id + data[3:]
+                    logger.debug("Patched SessionID placeholder with %d", session_id)
+                else:
+                    logger.warning("Session ID %d too large for 1-byte placeholder patch, sending as-is", session_id)
+
+        target_len = len(data)
+        preview = data[:100] if target_len > 100 else data
+        logger.debug("Sending %d raw bytes: %s", target_len, preview)
+        
         self._last_sent_data = data
         self._last_received_data = None
 
         try:
-            stream_id, response = self._loop.run_until_complete(
-                self._protocol.send_bidirectional_stream(data, timeout=self.timeout)
+            # Create a raw unidirectional stream (bypassing H3 tracking)
+            # We assume the fuzzed data includes the Stream Type (e.g. 0x54).
+            stream_id = self._loop.run_until_complete(
+                self._async_send_raw(data)
             )
-            self._last_received_data = response
-            if response is not None:
-                logger.debug("Received %d bytes on stream %d", len(response), stream_id)
-            else:
-                logger.debug("No response received for stream %d", stream_id)
-            return len(data)
+            return target_len
         except Exception:
             logger.exception("Exception during send")
             raise
 
+    async def _async_send_raw(self, data: bytes) -> int:
+        # Create raw stream
+        stream_id = self._protocol.create_raw_stream(is_unidirectional=True)
+        # Send data and close stream immediately (message-style)
+        self._protocol.send_raw_stream(stream_id, data, end_stream=True)
+        return stream_id
+
     def recv(self, max_bytes: int) -> bytes:
-        """Return previously stored response (up to max_bytes)."""
-        if self._last_received_data:
-            return self._last_received_data[:max_bytes]
-        return b""
+        """
+        Receive data from the WebTransport session.
+        This blocks until data is available or timeout.
+        """
+        if not self._loop or not self._protocol:
+            return b""
+        
+        try:
+            data = self._loop.run_until_complete(self._async_recv(timeout=1.0))
+            if data:
+                return data[:max_bytes]
+            return b""
+        except Exception as e:
+            logger.warning("Error receiving data: %s", e)
+            return b""
+
+    async def _async_recv(self, timeout: float = 1.0) -> bytes:
+        """Async helper to fetch next message from protocol queue."""
+        if not self._protocol:
+            return b""
+        
+        try:
+            # We try to drain the queue of 'stream' or 'datagram' messages
+            # For simplicity, return the first chunk of data we get.
+            queue = self._protocol._received_messages
+            type_, *args = await asyncio.wait_for(queue.get(), timeout=timeout)
+            
+            if type_ == 'stream':
+                stream_id, data = args
+                logger.debug("Async Recv: Stream %d data: %s", stream_id, data)
+                return data
+            elif type_ == 'datagram':
+                data = args[0]
+                logger.debug("Async Recv: Datagram: %s", data)
+                return data
+            else:
+                return b""
+        except asyncio.TimeoutError:
+            return b""
