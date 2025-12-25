@@ -94,8 +94,11 @@ def main():
             session.fuzz()
         except KeyboardInterrupt:
             logger.info("Fuzzing stopped by user")
+        except (TimeoutError, ConnectionError, RuntimeError) as e:
+            # Handle known connection/crash errors cleanly without full traceback
+            logger.error(f"Fuzzing halted: {e}")
         except Exception:
-            logger.exception("Fuzzing encountered an error")
+            logger.exception("Fuzzing encountered an unexpected error")
         finally:
             logger.info("Fuzzing session finished")
 

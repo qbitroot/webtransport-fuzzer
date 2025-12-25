@@ -25,7 +25,7 @@ class WebTransportConnection(ITargetConnection):
     can inspect and compare them.
     """
 
-    def __init__(self, url: str, timeout: float = 3.0):
+    def __init__(self, url: str, timeout: float = 1.0):
         self.url = url
         self.timeout = timeout
         self._protocol: Optional[WebTransportClient] = None
@@ -55,7 +55,8 @@ class WebTransportConnection(ITargetConnection):
             self._loop.run_until_complete(self._async_open())
             logger.info("Connection open")
         except Exception:
-            logger.exception("Failed to open connection")
+            # Clean logging here is redundant if we re-raise wrapped errors
+            # logger.exception("Failed to open connection") 
             if self._loop:
                 try:
                     self._loop.close()
@@ -86,15 +87,15 @@ class WebTransportConnection(ITargetConnection):
                 self._protocol.establish_session(self.authority, self.path),
                 timeout=self.timeout
             )
-        except Exception:
-            # If we timeout or fail, ensure we clean up the context
+        except asyncio.TimeoutError:
+            raise ConnectionError("Server Unreachable (Timeout)") from None
+        except Exception as e:
+            # Ensure we clean up the context if something else broke
             try:
-                 # We can't exit the context if we never entered it successfully?
-                 # Actually aioquic might leave tasks provided.
                  pass
             except:
                 pass
-            raise
+            raise ConnectionError(f"Server Unreachable (Error: {e})") from e
 
     def close(self):
         """Close session and loop cleanly."""

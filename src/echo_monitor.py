@@ -63,16 +63,46 @@ class EchoCompareMonitor(BaseMonitor):
             if recv is None or len(recv) == 0:
                 fuzz_data_logger.log_info("No response received. performing ACTIVE health check...")
                 
-                # Perform Health Check Immediately
+                # Step 1: Check health on CURRENT connection
                 is_alive = conn.send_health_check()
                 
                 if is_alive:
                     fuzz_data_logger.log_check("Health Check PASSED: Server is alive (silence was safe).")
                     return True
                 else:
-                    fuzz_data_logger.log_fail("Health Check FAILED: Server unresponsive!")
-                    save_failure(sent, b"")
-                    return False
+                    # Step 2: Current connection might be dead (closed by server), 
+                    # but server process might still be alive.
+                    fuzz_data_logger.log_info("Current connection failed health check. Probing with FRESH connection...")
+                    
+                    try:
+                        # Create a fresh connection probe
+                        # We need to import WebTransportConnection inside here or assume it's available.
+                        # Since we have the target object, we can see if we can instantiate a new connection like it.
+                        # For simplicity, we assume we can instantiate WebTransportConnection(url)
+                        
+                        # We need to import the class first to be safe, or get it from module.
+                        from src.fuzzer_connection import WebTransportConnection
+                        
+                        probe_conn = WebTransportConnection(conn.url, timeout=3.0)
+                        probe_conn.open()
+                        
+                        # Probe health
+                        probe_success = probe_conn.send_health_check()
+                        probe_conn.close()
+                        
+                        if probe_success:
+                             fuzz_data_logger.log_check("Probe PASSED: Server is alive. Current connection was just closed.")
+                             return True
+                        else:
+                             fuzz_data_logger.log_fail("Probe FAILED: Server unresponsive to fresh connection!")
+                             save_failure(sent, b"")
+                             raise RuntimeError("CRASH DETECTED: Server unreachable via fresh connection.")
+                             
+                    except Exception as probe_err:
+                        fuzz_data_logger.log_fail(f"Probe Exception: {probe_err}. SERVER DOWN.")
+                        save_failure(sent, b"")
+                        # CRITICAL: Raise exception to STOP fuzzing
+                        raise RuntimeError(f"CRASH DETECTED: Server probe failed: {probe_err}")
 
             # Case 2: Response received
             expected_payload = None
