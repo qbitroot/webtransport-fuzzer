@@ -9,6 +9,7 @@ from boofuzz import (
     s_block_end,
     s_get,
 )
+from src.callbacks import callback_fill_session_id
 
 # Constants for WebTransport over HTTP/3
 # https://www.ietf.org/archive/id/draft-ietf-webtrans-http3-02.html
@@ -48,6 +49,6 @@ def define_valid_webtransport_packet(session_name="webtransport_valid"):
     """
     s_initialize(session_name)
     s_static(WT_STREAM_TYPE_UNI, name="StreamType")
-    s_bytes(value=b"\xAA", name="SessionID", size=1) # Placeholder
-    s_string("HelloValidWorld", name="Payload")
+    s_bytes(value=b"\xAA", name="SessionID", size=1, fuzzable=False) # Placeholder
+    s_string("HelloValidWorld", name="Payload", fuzzable=False)
     return s_get(session_name)

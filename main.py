@@ -10,7 +10,7 @@ from boofuzz import Session, Target, FuzzLoggerText
 
 from src.fuzzer_connection import WebTransportConnection
 from src.echo_monitor import EchoCompareMonitor
-from src.boofuzz_definitions import define_webtransport_protocol, define_valid_webtransport_packet
+from src.boofuzz_definitions import define_webtransport_protocol, define_valid_webtransport_packet, callback_fill_session_id
 
 # ---- Logging setup ----
 LOG_FMT = "%(asctime)s [%(levelname)5s] %(name)s: %(message)s"
@@ -59,60 +59,58 @@ def main():
 
     if args.no_fuzz:
         logger.info("Running in VALIDATION MODE (--no-fuzz)")
-        logger.info("Sending a single valid WebTransport packet to verify connectivity...")
+        logger.info("Sending a single valid WebTransport packet via Boofuzz...")
+        
+        # Use the non-fuzzable definition
+        msg = define_valid_webtransport_packet()
+        # Connect with callback to inject session ID dynamically
+        session.connect(msg, callback=callback_fill_session_id)
         
         try:
+            # Open connection (High-Level check helper)
             connection.open()
             
-            # 1. High-Level Check (Control)
+            # 1. High-Level Check (Control) - Keep this as a sanity check of the library itself?
+            # The user said "use boofuzz no matter what", but High Level is useful context.
+            # I will keep Phase 1 (library check) but replace Phase 2 (Raw) with Boofuzz.
+            
             logger.info("--- Phase 1: High-Level Client Check ---")
             payload_hl = b"HelloHighLevel"
-            # We access the underlying protocol directly to use high-level methods
-            # This requires us to run a small coroutine on the loop
             async def send_hl():
                  await connection._protocol.send_unidirectional_stream(payload_hl)
-            
             connection._loop.run_until_complete(send_hl())
             
             # Receive response for High Level
-            response = connection.recv(1024)
-            logger.info("High-Level Response: %s", response)
-            
-            if b"HelloHighLevel" in response:
-                logger.info("Phase 1 SUCCESS: Server echoed high-level packet.")
-            else:
-                logger.warning("Phase 1 FAILED: Server did not echo high-level packet.")
+            try:
+                response = connection.recv(1024)
+                logger.info("High-Level Response: %s", response)
+                if b"HelloHighLevel" in response:
+                    logger.info("Phase 1 SUCCESS: Server echoed high-level packet.")
+                else:
+                    logger.warning("Phase 1 FAILED: Server did not echo high-level packet.")
+            except TimeoutError:
+                 logger.warning("Phase 1 TIMEOUT")
 
-            # 2. Low-Level Check (Target)
-            logger.info("--- Phase 2: Low-Level (Raw) Check ---")
-            # Construct a valid packet manually matching the definition
-            # [StreamType (0x54)] + [SessionID placeholder (0xAA)] + [Payload]
-            # connection.send will patch the session ID.
+            # 2. Boofuzz Validation Run
+            logger.info("--- Phase 2: Boofuzz Validation Run (Feature Check) ---")
             
-            # NOTE: For "Hello World" request by user
-            target_payload = b"Hello World"
-            # Stream Type 0x54 encoded as VarInt (2 bytes): \x40\x54
-            raw_payload = b"\x40\x54\xAA" + target_payload
-            connection.send(raw_payload)
+            # Close connection manually opened for Phase 1 so Boofuzz can manage it
+            connection.close()
             
-            # Read response
-            response = connection.recv(1024)
-            logger.info("Low-Level Response: %s", response)
+            # feature_check() sends the default values of messages to verify valid protocol
+            session.feature_check()
+
+            print("\nValidation run complete. Web UI is active.")
+            input("Press Enter to close validation session and exit...")
             
-            if target_payload in response:
-                logger.info("Phase 2 SUCCESS: Server echoed raw packet.")
-            else:
-                logger.warning("Phase 2 FAILED: Server did not echo raw packet. Debug: Sent header 0x54 + SessionID")
-                
         except Exception:
             logger.exception("Validation FAILED")
-        finally:
-            connection.close()
             
     else:
         logger.info("Running in FUZZING MODE")
         msg = define_webtransport_protocol()
-        session.connect(msg)
+        # Connect with callback to inject session ID dynamically
+        session.connect(msg, callback=callback_fill_session_id)
 
         logger.info("Starting fuzzing session")
         logger.info("Web UI available at: http://localhost:26000 (if enabled)")

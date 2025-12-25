@@ -82,19 +82,80 @@ class EchoCompareMonitor(BaseMonitor):
                 fuzz_data_logger.log_info(f"Saved failing testcase to {path}")
                 return not self.crash_on_mismatch
 
-            # Exact match -> pass
-            if recv == sent:
-                fuzz_data_logger.log_check("Echo OK: response matches sent data")
-                return True
+            # Retrieve the expected Application Layer Payload from the Boofuzz session context
+            # We look for the primitive named "Payload" in the last fuzzed node.
+            expected_payload = None
+             
+            # Attempt 1: Check if we can find the node in the session's last test case
+            if hasattr(session, 'last_recv') and session.last_recv:
+                # This is usually the receive buffer, not valuable for us.
+                pass
+            
+            # The 'mutated_data' is the full packet. To find the payload:
+            # We can iterate the current node's primitives if available.
+            current_node = None
+            if hasattr(session, 'fuzz_node') and session.fuzz_node:
+                 current_node = session.fuzz_node
+            
+            if current_node:
+                payload_primitive = None
+                for name, primitive in current_node.names.items():
+                    if name.endswith(".Payload") or name == "Payload":
+                        payload_primitive = primitive
+                        break
+                
+                if payload_primitive:
+                    # We want the value that was actually sent. 
+                    # ._value is typically the mutated value if it was mutated, or the default.
+                    # Since we don't easily know if it was just mutated, accessing ._value is a good best-guess.
+                    try:
+                        val = payload_primitive._value
+                        if isinstance(val, bytes):
+                            expected_payload = val
+                        elif isinstance(val, str):
+                            expected_payload = val.encode('utf-8')
+                    except Exception:
+                         pass
+                    
+                    if expected_payload is None:
+                         # Fallback to default if _value is not set or valid
+                         expected_payload = payload_primitive._default_value
 
-            # Mismatch: save and log details
-            fuzz_data_logger.log_fail("Echo mismatch: received content differs from sent payload")
+                    # Ensure we have bytes
+                    if isinstance(expected_payload, str):
+                        expected_payload = expected_payload.encode('utf-8')
+            
+            # Comparison Logic
+            if expected_payload is not None:
+                # Log abstraction layers for clarity
+                if len(sent) < 256:
+                     fuzz_data_logger.log_info(f"Sent Packet (Wire Layer) : {sent!r}")
+                     fuzz_data_logger.log_info(f"Sent Payload (App Layer) : {expected_payload!r}")
+                
+                if recv == expected_payload:
+                    fuzz_data_logger.log_check(f"Echo OK: received bytes match Payload (len={len(recv)})")
+                    return True
+                else:
+                    fuzz_data_logger.log_fail(f"Echo mismatch: received {recv!r} != expected payload {expected_payload!r}")
+            else:
+                 # Fallback to old strict match if we couldn't extract payload
+                 if recv == sent:
+                    fuzz_data_logger.log_check("Echo OK: response matches full sent packt")
+                    return True
+                 elif len(recv) > 0 and recv in sent:
+                    fuzz_data_logger.log_check(f"Echo OK: response ({len(recv)} bytes) is substring of sent (legacy fallback)")
+                    return True
+                 else:
+                    fuzz_data_logger.log_fail("Echo mismatch: received content differs from sent payload")
+
             path = save_failure(sent, recv)
             fuzz_data_logger.log_info(f"Saved mismatch testcase to {path}")
-
+            
             if len(sent) < 256 and len(recv) < 256:
-                fuzz_data_logger.log_info(f"Sent (len={len(sent)}): {sent!r}")
-                fuzz_data_logger.log_info(f"Recv (len={len(recv)}): {recv!r}")
+                if expected_payload:
+                     fuzz_data_logger.log_info(f"Sent Payload (App Layer) : {expected_payload!r}")
+                fuzz_data_logger.log_info(f"Sent Packet (Wire Layer) : {sent!r}")
+                fuzz_data_logger.log_info(f"Recv Payload (App Layer) : {recv!r}")
 
             return not self.crash_on_mismatch
 

@@ -111,22 +111,9 @@ class WebTransportConnection(ITargetConnection):
         if not self._loop or not self._protocol:
             raise RuntimeError("Connection not open")
 
-        # Dynamic Session ID Replacement
-        # The Boofuzz definition uses \xAA as a placeholder for the Session ID.
-        # Use position-based check: [StreamType(2)] [SessionID(1)] ...
-        # StreamType is now 2 bytes (\x40\x54).
-        if len(data) >= 3 and data[2] == 0xAA:
-            session_id = self.session_id
-            if session_id is not None:
-                # Simple VarInt encoding for small IDs (typical in simple tests)
-                # For robust fuzzing of larger IDs, we'd need full varint logic.
-                if session_id < 64:
-                    encoded_id = bytes([session_id])
-                    # Reconstruct data: [StreamType(2)] + [RealID] + [Rest]
-                    data = data[:2] + encoded_id + data[3:]
-                    logger.debug("Patched SessionID placeholder with %d", session_id)
-                else:
-                    logger.warning("Session ID %d too large for 1-byte placeholder patch, sending as-is", session_id)
+        # Dynamic Session ID is now handled by src.callbacks.callback_fill_session_id
+        # verifying and updating the Boofuzz graph before serialization.
+        pass
 
         target_len = len(data)
         preview = data[:100] if target_len > 100 else data
@@ -164,7 +151,11 @@ class WebTransportConnection(ITargetConnection):
         try:
             data = self._loop.run_until_complete(self._async_recv(timeout=1.0))
             if data:
-                return data[:max_bytes]
+                # Ensure the monitor can see what we received, even if Boofuzz target doesn't set it in feature_check
+                self._last_received_data = data[:max_bytes]
+                return self._last_received_data
+            
+            self._last_received_data = b""
             return b""
         except Exception as e:
             logger.warning("Error receiving data: %s", e)
@@ -175,21 +166,38 @@ class WebTransportConnection(ITargetConnection):
         if not self._protocol:
             return b""
         
-        try:
-            # We try to drain the queue of 'stream' or 'datagram' messages
-            # For simplicity, return the first chunk of data we get.
-            queue = self._protocol._received_messages
-            type_, *args = await asyncio.wait_for(queue.get(), timeout=timeout)
+        # Accumulate data until timeout expiration (or small silence)
+        # For fuzzing, we often want "everything sent in response to my input"
+        buffer = bytearray()
+        end_time = asyncio.get_event_loop().time() + timeout
+        
+        while True:
+            remaining = end_time - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
             
-            if type_ == 'stream':
-                stream_id, data = args
-                logger.debug("Async Recv: Stream %d data: %s", stream_id, data)
-                return data
-            elif type_ == 'datagram':
-                data = args[0]
-                logger.debug("Async Recv: Datagram: %s", data)
-                return data
-            else:
-                return b""
-        except asyncio.TimeoutError:
-            return b""
+            try:
+                # Use a shorter wait for subsequent chunks
+                current_wait = remaining
+                if len(buffer) > 0:
+                     # If we already have data, wait less for more (aggregating)
+                     current_wait = min(0.1, remaining)
+
+                queue = self._protocol._received_messages
+                type_, *args = await asyncio.wait_for(queue.get(), timeout=current_wait)
+                
+                if type_ == 'stream':
+                    stream_id, data = args
+                    logger.debug("Async Recv: Stream %d data: %s", stream_id, data)
+                    buffer.extend(data)
+                elif type_ == 'datagram':
+                    data = args[0]
+                    logger.debug("Async Recv: Datagram: %s", data)
+                    buffer.extend(data)
+            except asyncio.TimeoutError:
+                break
+            except Exception as e:
+                logger.warning("Async recv exception: %s", e)
+                break
+        
+        return bytes(buffer)
