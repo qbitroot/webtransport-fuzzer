@@ -77,8 +77,24 @@ class WebTransportConnection(ITargetConnection):
             configuration=config,
             create_protocol=WebTransportClient,
         )
-        self._protocol = await self._client_context.__aenter__()
-        await self._protocol.establish_session(self.authority, self.path)
+        try:
+            self._protocol = await asyncio.wait_for(
+                self._client_context.__aenter__(), 
+                timeout=self.timeout
+            )
+            await asyncio.wait_for(
+                self._protocol.establish_session(self.authority, self.path),
+                timeout=self.timeout
+            )
+        except Exception:
+            # If we timeout or fail, ensure we clean up the context
+            try:
+                 # We can't exit the context if we never entered it successfully?
+                 # Actually aioquic might leave tasks provided.
+                 pass
+            except:
+                pass
+            raise
 
     def close(self):
         """Close session and loop cleanly."""
@@ -201,3 +217,33 @@ class WebTransportConnection(ITargetConnection):
                 break
         
         return bytes(buffer)
+
+    def send_health_check(self) -> bool:
+        """
+        Send a synchronous health check (bidirectional stream ping)
+        to verify if the server is still alive and responsive.
+        
+        Returns:
+            True if health check succeeds (server responded), False otherwise.
+        """
+        if not self._loop or not self._protocol:
+            logger.error("Health check skipped: connection not open")
+            return False
+
+        async def _health_check():
+            try:
+                # Send explicit health check payload
+                sid, response = await self._protocol.send_bidirectional_stream(b"HEALTHCHECK", timeout=1.0)
+                if response:
+                    logger.debug("Health check response: %s", response)
+                    return True
+                return False
+            except Exception as e:
+                logger.warning("Health check failed: %s", e)
+                return False
+
+        try:
+            return self._loop.run_until_complete(_health_check())
+        except Exception:
+            logger.exception("Health check wrapper exception")
+            return False

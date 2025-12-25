@@ -59,52 +59,26 @@ def main():
 
     if args.no_fuzz:
         logger.info("Running in VALIDATION MODE (--no-fuzz)")
-        logger.info("Sending a single valid WebTransport packet via Boofuzz...")
-        
-        # Use the non-fuzzable definition
-        msg = define_valid_webtransport_packet()
-        # Connect with callback to inject session ID dynamically
-        session.connect(msg, callback=callback_fill_session_id)
+        logger.info("Opening connection to verify server health directly...")
         
         try:
-            # Open connection (High-Level check helper)
+            # Open generic connection
             connection.open()
             
-            # 1. High-Level Check (Control) - Keep this as a sanity check of the library itself?
-            # The user said "use boofuzz no matter what", but High Level is useful context.
-            # I will keep Phase 1 (library check) but replace Phase 2 (Raw) with Boofuzz.
+            # Use the EXACT same check logic that fuzzing uses (DRY)
+            logger.info("Sending Health Check (Standard Probe)...")
+            success = connection.send_health_check()
             
-            logger.info("--- Phase 1: High-Level Client Check ---")
-            payload_hl = b"HelloHighLevel"
-            async def send_hl():
-                 await connection._protocol.send_unidirectional_stream(payload_hl)
-            connection._loop.run_until_complete(send_hl())
+            if success:
+                logger.info("Validation SUCCESS: Server responded to health check.")
+            else:
+                logger.error("Validation FAILED: Server did not respond to health check.")
             
-            # Receive response for High Level
-            try:
-                response = connection.recv(1024)
-                logger.info("High-Level Response: %s", response)
-                if b"HelloHighLevel" in response:
-                    logger.info("Phase 1 SUCCESS: Server echoed high-level packet.")
-                else:
-                    logger.warning("Phase 1 FAILED: Server did not echo high-level packet.")
-            except TimeoutError:
-                 logger.warning("Phase 1 TIMEOUT")
-
-            # 2. Boofuzz Validation Run
-            logger.info("--- Phase 2: Boofuzz Validation Run (Feature Check) ---")
-            
-            # Close connection manually opened for Phase 1 so Boofuzz can manage it
+            # Clean exit
             connection.close()
-            
-            # feature_check() sends the default values of messages to verify valid protocol
-            session.feature_check()
 
-            print("\nValidation run complete. Web UI is active.")
-            input("Press Enter to close validation session and exit...")
-            
         except Exception:
-            logger.exception("Validation FAILED")
+            logger.exception("Validation encountered an error")
             
     else:
         logger.info("Running in FUZZING MODE")

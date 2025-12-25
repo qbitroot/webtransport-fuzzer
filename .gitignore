@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 boofuzz-results/
+failures/
 __pycache__/
 *.py[codz]
 *$py.class
