@@ -23,11 +23,17 @@ class WebTransportConnection(ITargetConnection):
 
     It stores last sent/received data on the object, so the monitor
     can inspect and compare them.
+    
+    Supports multiple send modes:
+    - 'unidirectional': Raw unidirectional stream (default)
+    - 'bidirectional': Bidirectional stream with response
+    - 'datagram': Unreliable datagram
     """
 
-    def __init__(self, url: str, timeout: float = 1.0):
+    def __init__(self, url: str, timeout: float = 1.0, send_mode: str = "unidirectional"):
         self.url = url
         self.timeout = timeout
+        self._send_mode = send_mode
         self._protocol: Optional[WebTransportClient] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._client_context = None
@@ -40,7 +46,7 @@ class WebTransportConnection(ITargetConnection):
         self.path = parsed.path or "/"
         self.authority = f"{self.host}:{self.port}"
 
-        logger.info("WebTransportConnection initialized for %s", url)
+        logger.info("WebTransportConnection initialized for %s (mode: %s)", url, send_mode)
 
     @property
     def info(self) -> str:
@@ -122,40 +128,49 @@ class WebTransportConnection(ITargetConnection):
 
     def send(self, data: bytes) -> int:
         """
-        Send fuzzed data via a new raw unidirectional stream.
-        This assumes 'data' contains the HTTP/3 Stream Type + Session ID + Payload.
+        Send fuzzed data via the configured send mode.
+        Dispatches to unidirectional, bidirectional, or datagram based on _send_mode.
         """
         if not self._loop or not self._protocol:
             raise RuntimeError("Connection not open")
 
-        # Dynamic Session ID is now handled by src.callbacks.callback_fill_session_id
-        # verifying and updating the Boofuzz graph before serialization.
-        pass
-
         target_len = len(data)
         preview = data[:100] if target_len > 100 else data
-        logger.debug("Sending %d raw bytes: %s", target_len, preview)
+        logger.debug("Sending %d bytes via %s: %s", target_len, self._send_mode, preview)
         
         self._last_sent_data = data
         self._last_received_data = None
 
         try:
-            # Create a raw unidirectional stream (bypassing H3 tracking)
-            # We assume the fuzzed data includes the Stream Type (e.g. 0x54).
-            stream_id = self._loop.run_until_complete(
-                self._async_send_raw(data)
-            )
+            if self._send_mode == "bidirectional":
+                self._loop.run_until_complete(self._async_send_bidirectional(data))
+            elif self._send_mode == "datagram":
+                self._loop.run_until_complete(self._async_send_datagram(data))
+            else:  # Default: unidirectional
+                self._loop.run_until_complete(self._async_send_unidirectional(data))
             return target_len
         except Exception:
             logger.exception("Exception during send")
             raise
 
-    async def _async_send_raw(self, data: bytes) -> int:
-        # Create raw stream
+    async def _async_send_unidirectional(self, data: bytes) -> int:
+        """Send via raw unidirectional stream (default fuzzing mode)."""
         stream_id = self._protocol.create_raw_stream(is_unidirectional=True)
-        # Send data and close stream immediately (message-style)
         self._protocol.send_raw_stream(stream_id, data, end_stream=True)
         return stream_id
+
+    async def _async_send_bidirectional(self, data: bytes) -> int:
+        """Send via bidirectional stream and capture response."""
+        stream_id = self._protocol.create_raw_stream(is_unidirectional=False)
+        self._protocol.send_raw_stream(stream_id, data, end_stream=True)
+        # Note: Response is captured via recv() if needed
+        return stream_id
+
+    async def _async_send_datagram(self, data: bytes):
+        """Send via unreliable datagram."""
+        if self._protocol._session_id is None:
+            raise RuntimeError("Session not established for datagram")
+        self._protocol.send_datagram(data)
 
     def recv(self, max_bytes: int) -> bytes:
         """
@@ -166,7 +181,7 @@ class WebTransportConnection(ITargetConnection):
             return b""
         
         try:
-            data = self._loop.run_until_complete(self._async_recv(timeout=1.0))
+            data = self._loop.run_until_complete(self._async_recv(timeout=0.1))
             if data:
                 # Ensure the monitor can see what we received, even if Boofuzz target doesn't set it in feature_check
                 self._last_received_data = data[:max_bytes]
