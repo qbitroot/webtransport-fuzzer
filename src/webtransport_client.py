@@ -183,3 +183,17 @@ class WebTransportClient(QuicConnectionProtocol):
         self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=end_stream)
         self.transmit()
         logger.debug("Sent raw stream (stream %d): %d bytes", stream_id, len(data))
+
+    def send_capsule(self, data: bytes):
+        """
+        Send raw capsule data on the CONNECT stream (session control).
+        Capsules are sent on the same stream as the CONNECT request.
+        Format: [Type (VarInt)][Length (VarInt)][Payload]
+        """
+        if self._session_id is None:
+            raise RuntimeError("WebTransport session not established")
+        
+        # Send on the CONNECT stream (session_id is the CONNECT stream ID)
+        self._quic.send_stream_data(stream_id=self._session_id, data=data, end_stream=False)
+        self.transmit()
+        logger.debug("Sent capsule on CONNECT stream %d: %d bytes", self._session_id, len(data))

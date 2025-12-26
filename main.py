@@ -15,6 +15,9 @@ from src.boofuzz_definitions import (
     define_bidirectional_stream,
     define_datagram,
     define_malformed_frames,
+    define_capsule_generic,
+    define_capsule_drain,
+    define_capsule_close,
     define_valid_webtransport_packet,
 )
 from src.callbacks import callback_fill_session_id
@@ -31,6 +34,7 @@ os.makedirs(FAILURES_DIR, exist_ok=True)
 
 # Available fuzzing modes and their definitions
 FUZZ_MODES = {
+    # Data streams
     "unidirectional": {
         "define_func": define_webtransport_protocol,
         "send_mode": "unidirectional",
@@ -39,7 +43,7 @@ FUZZ_MODES = {
     "bidirectional": {
         "define_func": define_bidirectional_stream,
         "send_mode": "bidirectional", 
-        "desc": "Bidirectional streams",
+        "desc": "Bidirectional streams (0x41)",
     },
     "datagram": {
         "define_func": define_datagram,
@@ -50,6 +54,22 @@ FUZZ_MODES = {
         "define_func": define_malformed_frames,
         "send_mode": "unidirectional",
         "desc": "Malformed/edge-case frames",
+    },
+    # Control capsules (NEW)
+    "capsule": {
+        "define_func": define_capsule_generic,
+        "send_mode": "capsule",
+        "desc": "Generic HTTP/3 Capsules (control channel)",
+    },
+    "drain": {
+        "define_func": define_capsule_drain,
+        "send_mode": "capsule",
+        "desc": "DRAIN_WEBTRANSPORT_SESSION Capsule (0x78AE)",
+    },
+    "close": {
+        "define_func": define_capsule_close,
+        "send_mode": "capsule",
+        "desc": "CLOSE_WEBTRANSPORT_SESSION Capsule (0x2843)",
     },
 }
 
@@ -98,7 +118,12 @@ def main():
         "--mode",
         choices=list(FUZZ_MODES.keys()),
         default="unidirectional",
-        help="Fuzzing mode: unidirectional, bidirectional, datagram, or malformed"
+        help="Fuzzing mode (see --list-modes for descriptions)"
+    )
+    parser.add_argument(
+        "--list-modes",
+        action="store_true",
+        help="List all available fuzzing modes and exit"
     )
     parser.add_argument(
         "--fuzz-payload",
@@ -106,6 +131,13 @@ def main():
         help="Also fuzz payload content (default: only fuzz packet structure)"
     )
     args = parser.parse_args()
+
+    if args.list_modes:
+        print("\nAvailable fuzzing modes:\n")
+        for name, config in FUZZ_MODES.items():
+            print(f"  {name:15} - {config['desc']}")
+        print()
+        return
 
     target_url = args.url
 

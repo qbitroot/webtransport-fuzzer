@@ -146,6 +146,8 @@ class WebTransportConnection(ITargetConnection):
                 self._loop.run_until_complete(self._async_send_bidirectional(data))
             elif self._send_mode == "datagram":
                 self._loop.run_until_complete(self._async_send_datagram(data))
+            elif self._send_mode == "capsule":
+                self._loop.run_until_complete(self._async_send_capsule(data))
             else:  # Default: unidirectional
                 self._loop.run_until_complete(self._async_send_unidirectional(data))
             return target_len
@@ -171,6 +173,12 @@ class WebTransportConnection(ITargetConnection):
         if self._protocol._session_id is None:
             raise RuntimeError("Session not established for datagram")
         self._protocol.send_datagram(data)
+
+    async def _async_send_capsule(self, data: bytes):
+        """Send capsule on CONNECT stream (control channel)."""
+        if self._protocol._session_id is None:
+            raise RuntimeError("Session not established for capsule")
+        self._protocol.send_capsule(data)
 
     def recv(self, max_bytes: int) -> bytes:
         """
