@@ -117,10 +117,17 @@ async def demo_mode(client: WebTransportClient):
 
 
 async def main():
+    # Get mkcert CA root path
+    import os
+    # Use system CA bundle (includes mkcert CA after mkcert -install)
+    system_ca = "/etc/ssl/certs/ca-certificates.crt"
+    
     parser = argparse.ArgumentParser(description="WebTransport Echo Client")
-    parser.add_argument("--host", default="wt-ord.akaleapi.net", help="Server hostname")
+    parser.add_argument("--host", default="127.0.0.1", help="Server hostname")
     parser.add_argument("--port", type=int, default=6161, help="Server port")
     parser.add_argument("--path", default="/echo", help="WebTransport endpoint path")
+    parser.add_argument("--ca-cert", default=system_ca,
+                       help="CA certificate for TLS verification (default: system CA bundle)")
     parser.add_argument("--insecure", action="store_true", default=False,
                        help="Skip certificate verification (for self-signed certs)")
     parser.add_argument("--interactive", "-i", action="store_true",
@@ -136,6 +143,11 @@ async def main():
     if args.insecure:
         config.verify_mode = False
         logger.warning("Certificate verification disabled (insecure mode)")
+    elif args.ca_cert and os.path.exists(args.ca_cert):
+        config.load_verify_locations(args.ca_cert)
+        logger.info("Loaded CA certificate from: %s", args.ca_cert)
+    else:
+        logger.warning("CA certificate not found at %s, connection may fail", args.ca_cert)
 
     authority = f"{args.host}:{args.port}"
     
