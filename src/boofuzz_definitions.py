@@ -42,6 +42,10 @@ CAPSULE_STREAM_DATA_BLOCKED = b"\x80\x19\x0B\x4D\x42" # WT_STREAM_DATA_BLOCKED (
 CAPSULE_STREAMS_BLOCKED_BIDI = b"\x80\x19\x0B\x4D\x43" # WT_STREAMS_BLOCKED bidi (0x190B4D43)
 CAPSULE_STREAMS_BLOCKED_UNI = b"\x80\x19\x0B\x4D\x44"  # WT_STREAMS_BLOCKED uni (0x190B4D44)
 
+# Stream Control Capsules
+CAPSULE_RESET_STREAM = b"\x80\x19\x0B\x4D\x39"        # WT_RESET_STREAM (0x190B4D39)
+CAPSULE_STOP_SENDING = b"\x80\x19\x0B\x4D\x3A"        # WT_STOP_SENDING (0x190B4D3A)
+
 # VarInt encoding helper for 2-byte values (0x40 prefix)
 def encode_varint_2byte(value):
     """Encode a value 64-16383 as 2-byte VarInt."""
@@ -231,6 +235,8 @@ def define_capsule_generic(session_name="capsule_generic", fuzz_payload=False):
             # Flow control types (0x190B4D3D...44) - pre-encoded as 4-byte VarInts
             b"\x99\x0B\x4D\x3D",  # WT_MAX_DATA (VarInt 0x190B4D3D -> 0x99...)
             b"\x99\x0B\x4D\x3E",  # WT_MAX_STREAM_DATA
+            b"\x99\x0B\x4D\x39",  # WT_RESET_STREAM
+            b"\x99\x0B\x4D\x3A",  # WT_STOP_SENDING
         ], name="KnownTypes")
         
         # Edge case VarInts
@@ -358,6 +364,66 @@ def define_capsule_close(session_name="capsule_close", fuzz_payload=False):
         ], name="ReasonPhrase")
     s_block_end("ClosePayload")
     
+    return s_get(session_name)
+
+
+def define_capsule_reset_stream(session_name="capsule_reset", fuzz_payload=False):
+    """
+    WT_RESET_STREAM Capsule (0x190B4D39).
+    Format: [Type][Length][StreamID][ErrorCode]
+    """
+    s_initialize(session_name)
+    
+    # Type
+    s_static(CAPSULE_RESET_STREAM, name="Type")
+
+    # Length (VarInt) - StreamID (VarInt) + ErrorCode (VarInt)
+    # Typically 1-8 bytes + 1-8 bytes.
+    if s_block_start("ResetLengthGroup"):
+        s_group(values=[
+            b"\x02",      # Min (1 byte ID + 1 byte Error)
+            b"\x00",      # Invalid (0)
+            b"\x10",      # Larger
+        ], name="Length")
+    s_block_end("ResetLengthGroup")
+    
+    # Payload
+    if s_block_start("ResetPayload"):
+        # Stream ID
+        s_group(values=[
+             b"\x00",     # ID 0
+             b"\x04",     # ID 4 (Client Bidi 0)
+        ], name="StreamID")
+        
+        # Error Code
+        s_group(values=[
+            b"\x00",      # No Error
+            b"\x01",      # Error 1
+        ], name="ErrorCode")
+    s_block_end("ResetPayload")
+
+    return s_get(session_name)
+
+
+def define_capsule_stop_sending(session_name="capsule_stop", fuzz_payload=False):
+    """
+    WT_STOP_SENDING Capsule (0x190B4D3A).
+    Format: [Type][Length][StreamID][ErrorCode]
+    """
+    s_initialize(session_name)
+    
+    # Type
+    s_static(CAPSULE_STOP_SENDING, name="Type")
+
+    # Length
+    s_static(b"\x02", name="Length") # Simplified for now
+    
+    # Payload
+    if s_block_start("StopPayload"):
+        s_byte(0, name="StreamID")
+        s_byte(0, name="ErrorCode")
+    s_block_end("StopPayload")
+
     return s_get(session_name)
 
 

@@ -19,7 +19,10 @@ from src.boofuzz_definitions import (
     define_capsule_drain,
     define_capsule_close,
     define_stream_dos,
+    define_stream_dos,
     define_valid_webtransport_packet,
+    define_capsule_reset_stream,
+    define_capsule_stop_sending,
 )
 from src.callbacks import callback_fill_session_id
 
@@ -76,6 +79,11 @@ FUZZ_MODES = {
         "define_func": define_stream_dos,
         "send_mode": "unidirectional",
         "desc": "DoS: 10k Small Streams (Resource Exhaustion)",
+    },
+    "multistep": {
+        "define_func": None, # Handled specially
+        "send_mode": "special",
+        "desc": "Multi-Step Sequences (State Violations)",
     },
 }
 
@@ -191,17 +199,47 @@ def main():
         # Connect nodes to the session graph
         for mode_name, mode_config in modes_to_run:
             logger.info("Registering mode: %s", mode_name)
-            
-            msg = mode_config["define_func"](
-                session_name=f"wt_{mode_name}",
-                fuzz_payload=args.fuzz_payload
-            )
-            
-            # Use specific callback that sets the correct send_mode
-            session.connect(
-                msg, 
-                callback=make_mode_callback(mode_config["send_mode"])
-            )
+
+            if mode_name == "multistep":
+                logger.info("Building Multi-Step Graph...")
+                
+                # Sequence 1: Stream -> Reset Stream (Close) -> Stream (Attempt to send on closed?)
+                # We link Step 1 (Stream) -> Step 2 (Reset).
+                # Note: Probabilistic matching of IDs relies on fuzzing same small integers (0, 1...).
+                ms_step1 = define_webtransport_protocol("ms_stream_open", fuzz_payload=args.fuzz_payload)
+                ms_step2 = define_capsule_reset_stream("ms_reset_stream")
+                
+                # Connect Root -> Stream
+                session.connect(ms_step1, callback=make_mode_callback("unidirectional"))
+                # Connect Stream -> Reset
+                session.connect(ms_step1, ms_step2, callback=make_mode_callback("capsule"))
+
+                # Sequence 2: Drain Session -> Open New Stream (Should fail/ignore)
+                ms_drain = define_capsule_drain("ms_drain")
+                ms_post_drain = define_webtransport_protocol("ms_post_drain", fuzz_payload=args.fuzz_payload)
+                
+                session.connect(ms_drain, callback=make_mode_callback("capsule"))
+                session.connect(ms_drain, ms_post_drain, callback=make_mode_callback("unidirectional"))
+
+                # Sequence 3: Close Session -> Open New Stream
+                ms_close = define_capsule_close("ms_close")
+                ms_post_close = define_webtransport_protocol("ms_post_close", fuzz_payload=args.fuzz_payload)
+                
+                session.connect(ms_close, callback=make_mode_callback("capsule"))
+                session.connect(ms_close, ms_post_close, callback=make_mode_callback("unidirectional"))
+
+            else:
+                # Standard Single-Step Mode
+                msg = mode_config["define_func"](
+                    session_name=f"wt_{mode_name}",
+                    fuzz_payload=args.fuzz_payload
+                )
+                
+                # Use specific callback that sets the correct send_mode
+                session.connect(
+                    msg, 
+                    callback=make_mode_callback(mode_config["send_mode"])
+                )
 
         try:
             session.fuzz()
