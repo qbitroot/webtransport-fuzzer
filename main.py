@@ -146,19 +146,59 @@ def main():
     )
     logger.info("Target: %s", target_url)
 
+    logger.info("Target: %s", target_url)
+
     if args.no_fuzz:
         logger.info("Running in VALIDATION MODE (--no-fuzz)")
         connection = WebTransportConnection(target_url, timeout=3.0)
         
         try:
             connection.open()
-            logger.info("Sending Health Check (Standard Probe)...")
-            success = connection.send_health_check()
             
-            if success:
-                logger.info("Validation SUCCESS: Server responded to health check.")
+            if args.mode == "multistep":
+                logger.info("Verifying Multi-Step Sequences...")
+                
+                # Manual validation of the sequences
+                # Sequence 1: Stream -> Reset
+                logger.info("[1/3] Testing Open -> Reset Stream...")
+                sid = connection.send(b"\x40\x54" + b"\x00" + b"Step1") # Open Stream 0
+                logger.info(f"   -> Sent Stream Open (SID={sid} / Manual)")
+                time.sleep(0.1)
+                
+                # Reset Stream 0 directly using capsule bytes
+                # 0x190B4D39 (Reset) + Length 2 + StreamID 0 + Error 0
+                reset_capsule = b"\x80\x19\x0B\x4D\x39" + b"\x02" + b"\x00" + b"\x00"
+                connection.set_send_mode("capsule")
+                connection.send(reset_capsule)
+                logger.info("   -> Sent Reset Stream Capsule")
+                time.sleep(0.1)
+                
+                # Sequence 2: Drain -> New Stream
+                logger.info("[2/3] Testing Drain Session -> New Stream...")
+                drain_capsule = b"\x80\x00\x78\xAE" + b"\x00"
+                connection.set_send_mode("capsule")
+                connection.send(drain_capsule)
+                logger.info("   -> Sent Drain Capsule")
+                time.sleep(0.1)
+                
+                connection.set_send_mode("unidirectional")
+                try:
+                    connection.send(b"\x40\x54" + b"\x04" + b"PostDrain")
+                    logger.info("   -> Sent Post-Drain Stream (Server should handle/ignore)")
+                except Exception as e:
+                    logger.info(f"   -> Post-Drain Send failed (Expected if closed): {e}")
+
+                logger.info("Multi-step validation sequences completed without client crash.")
+                
             else:
-                logger.error("Validation FAILED: Server did not respond to health check.")
+                # Standard Health Check
+                logger.info("Sending Health Check (Standard Probe)...")
+                success = connection.send_health_check()
+                
+                if success:
+                    logger.info("Validation SUCCESS: Server responded to health check.")
+                else:
+                    logger.error("Validation FAILED: Server did not respond to health check.")
             
             connection.close()
         except Exception:
