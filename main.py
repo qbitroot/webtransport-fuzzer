@@ -18,6 +18,7 @@ from src.boofuzz_definitions import (
     define_capsule_generic,
     define_capsule_drain,
     define_capsule_close,
+    define_stream_dos,
     define_valid_webtransport_packet,
 )
 from src.callbacks import callback_fill_session_id
@@ -66,48 +67,33 @@ FUZZ_MODES = {
         "send_mode": "capsule",
         "desc": "DRAIN_WEBTRANSPORT_SESSION Capsule (0x78AE)",
     },
-    "close": {
+    "wt_close": {
         "define_func": define_capsule_close,
         "send_mode": "capsule",
         "desc": "CLOSE_WEBTRANSPORT_SESSION Capsule (0x2843)",
     },
+    "wt_stream_dos": {
+        "define_func": define_stream_dos,
+        "send_mode": "unidirectional",
+        "desc": "DoS: 10k Small Streams (Resource Exhaustion)",
+    },
 }
 
 
-def run_fuzzing_mode(target_url: str, mode_name: str, mode_config: dict, fuzz_payload: bool):
-    """Run fuzzing for a single specific mode."""
-    logger.info("=" * 60)
-    logger.info("Starting %s fuzzing: %s", mode_name.upper(), mode_config["desc"])
-    logger.info("Payload fuzzing: %s", "ENABLED" if fuzz_payload else "DISABLED (structure only)")
-    logger.info("=" * 60)
-    
-    connection = WebTransportConnection(
-        target_url, 
-        timeout=3.0, 
-        send_mode=mode_config["send_mode"]
-    )
-    
-    echo_monitor = EchoCompareMonitor(crash_on_mismatch=True)
-    target = Target(connection=connection, monitors=[echo_monitor])
-
-    session = Session(
-        target=target,
-        fuzz_loggers=[FuzzLoggerText()],
-        sleep_time=0.0,
-        restart_sleep_time=2.0,
-        reuse_target_connection=False,
-    )
-
-    msg = mode_config["define_func"](fuzz_payload=fuzz_payload)
-    session.connect(msg, callback=callback_fill_session_id)
-
-    try:
-        session.fuzz()
-    except KeyboardInterrupt:
-        logger.info("Fuzzing stopped by user")
-        raise
-    except (TimeoutError, ConnectionError, RuntimeError) as e:
-        logger.error(f"Fuzzing halted: {e}")
+def make_mode_callback(send_mode: str):
+    """Factory for a callback that sets the connection's send mode."""
+    def callback(target, fuzz_data_logger, session, node, edge, *args, **kwargs):
+        # 1. Update send mode
+        try:
+            if hasattr(target, "_target_connection"):
+                target._target_connection.set_send_mode(send_mode)
+        except Exception as e:
+            fuzz_data_logger.log_error(f"Failed to set send mode: {e}")
+            
+        # 2. Chain to the session ID callback
+        callback_fill_session_id(target, fuzz_data_logger, session, node, edge, *args, **kwargs)
+        
+    return callback
 
 
 def main():
@@ -116,9 +102,9 @@ def main():
     parser.add_argument("--no-fuzz", action="store_true", help="Run in validation mode")
     parser.add_argument(
         "--mode",
-        choices=list(FUZZ_MODES.keys()),
+        choices=list(FUZZ_MODES.keys()) + ["all"],
         default="unidirectional",
-        help="Fuzzing mode (see --list-modes for descriptions)"
+        help="Fuzzing mode: specific mode name or 'all' to run all modes sequentially"
     )
     parser.add_argument(
         "--list-modes",
@@ -136,6 +122,7 @@ def main():
         print("\nAvailable fuzzing modes:\n")
         for name, config in FUZZ_MODES.items():
             print(f"  {name:15} - {config['desc']}")
+        print(f"  {'all':15} - Run all modes sequentially")
         print()
         return
 
@@ -171,16 +158,57 @@ def main():
             
     else:
         logger.info("Running in FUZZING MODE")
-        mode_config = FUZZ_MODES[args.mode]
         
-        logger.info("Mode: %s", args.mode)
+        # Determine which modes to run
+        if args.mode == "all":
+            modes_to_run = list(FUZZ_MODES.items())
+            logger.info("Mode: ALL (%d modes)", len(modes_to_run))
+        else:
+            modes_to_run = [(args.mode, FUZZ_MODES[args.mode])]
+            logger.info("Mode: %s", args.mode)
+        
         logger.info("Web UI available at: http://localhost:26000 (if enabled)")
         logger.info("Press Ctrl+C to stop")
 
+        # Initialize SINGLE Session and Connection
+        connection = WebTransportConnection(
+            target_url, 
+            timeout=3.0, 
+            send_mode="unidirectional"  # Default, overridden by callback
+        )
+        
+        echo_monitor = EchoCompareMonitor(crash_on_mismatch=True)
+        target = Target(connection=connection, monitors=[echo_monitor])
+
+        session = Session(
+            target=target,
+            fuzz_loggers=[FuzzLoggerText()],
+            sleep_time=0.0,
+            restart_sleep_time=2.0,
+            reuse_target_connection=False,
+        )
+
+        # Connect nodes to the session graph
+        for mode_name, mode_config in modes_to_run:
+            logger.info("Registering mode: %s", mode_name)
+            
+            msg = mode_config["define_func"](
+                session_name=f"wt_{mode_name}",
+                fuzz_payload=args.fuzz_payload
+            )
+            
+            # Use specific callback that sets the correct send_mode
+            session.connect(
+                msg, 
+                callback=make_mode_callback(mode_config["send_mode"])
+            )
+
         try:
-            run_fuzzing_mode(target_url, args.mode, mode_config, args.fuzz_payload)
+            session.fuzz()
         except KeyboardInterrupt:
             logger.info("Fuzzing stopped by user")
+        except (TimeoutError, ConnectionError, RuntimeError) as e:
+            logger.error(f"Fuzzing halted: {e}")
         except Exception:
             logger.exception("Fuzzing encountered an unexpected error")
         finally:

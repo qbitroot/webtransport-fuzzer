@@ -196,8 +196,6 @@ class WebTransportProtocol(QuicConnectionProtocol):
                        status_code: int,
                        end_stream=False) -> None:
         headers = [(b":status", str(status_code).encode())]
-        if status_code == 200:
-            headers.append((b"sec-webtransport-http3-draft", b"draft02"))
         self._http.send_headers(
             stream_id=stream_id, headers=headers, end_stream=end_stream)
 

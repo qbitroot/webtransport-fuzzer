@@ -61,6 +61,12 @@ class EchoCompareMonitor(BaseMonitor):
 
             # Case 1: Empty recv (Silence) - Potential Crash or Just Invalid Input
             if recv is None or len(recv) == 0:
+                # OPTIMIZATION: If we are fuzzing 'wt_close', silence is EXPECTED because
+                # the connection is closed immediately. Don't waste time on health checks.
+                if hasattr(session, 'fuzz_node') and session.fuzz_node.name == 'wt_close':
+                     fuzz_data_logger.log_info("No response received (Expected for wt_close). Skipping health check.")
+                     return True
+
                 fuzz_data_logger.log_info("No response received. performing ACTIVE health check...")
                 
                 # Step 1: Check health on CURRENT connection

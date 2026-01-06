@@ -90,7 +90,6 @@ class WebTransportClient(QuicConnectionProtocol):
             (b":authority", authority.encode()),
             (b":path", path.encode()),
             (b":protocol", b"webtransport"),
-            (b"sec-webtransport-http3-draft", b"draft02"),
         ]
         
         logger.info("Establishing WebTransport session to %s%s", authority, path)

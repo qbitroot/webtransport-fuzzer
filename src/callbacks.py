@@ -60,7 +60,7 @@ def callback_fill_session_id(target, fuzz_data_logger, session, node, edge, *arg
                 
                 logger.debug(f"Updated SessionID primitive to {session_id} and cleared cache")
         else:
-            logger.warning(f"SessionID primitive not found in node names: {list(node.names.keys())}")
+            logger.debug(f"SessionID primitive not found in node names: {list(node.names.keys())}")
                 
     except Exception as e:
         logger.error(f"Callback failed: {e}")

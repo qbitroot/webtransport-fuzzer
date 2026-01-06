@@ -48,6 +48,10 @@ class WebTransportConnection(ITargetConnection):
 
         logger.info("WebTransportConnection initialized for %s (mode: %s)", url, send_mode)
 
+    def set_send_mode(self, mode: str):
+        """Update the send mode dynamically."""
+        self._send_mode = mode
+
     @property
     def info(self) -> str:
         return f"WebTransport({self.url})"
