@@ -9,7 +9,7 @@ import time
 from boofuzz import Session, Target, FuzzLoggerText
 
 from src.fuzzer_connection import WebTransportConnection
-from src.echo_monitor import EchoCompareMonitor
+from src.echo_monitor import EchoCompareMonitor, ServerDownError
 from src.boofuzz_definitions import (
     define_webtransport_protocol,
     define_bidirectional_stream,
@@ -124,6 +124,17 @@ def main():
         action="store_true",
         help="Also fuzz payload content (default: only fuzz packet structure)"
     )
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=1,
+        help="Start fuzzing from this test case index"
+    )
+    parser.add_argument(
+        "--end-index",
+        type=int,
+        help="Stop fuzzing after this test case index"
+    )
     args = parser.parse_args()
 
     if args.list_modes:
@@ -234,6 +245,8 @@ def main():
             sleep_time=0.0,
             restart_sleep_time=2.0,
             reuse_target_connection=False,
+            index_start=args.start_index,
+            index_end=args.end_index,
         )
 
         # Connect nodes to the session graph
@@ -285,6 +298,9 @@ def main():
             session.fuzz()
         except KeyboardInterrupt:
             logger.info("Fuzzing stopped by user")
+        except ServerDownError as e:
+            logger.critical(f"Fuzzing ABORTED: {e}")
+            sys.exit(1)
         except (TimeoutError, ConnectionError, RuntimeError) as e:
             logger.error(f"Fuzzing halted: {e}")
         except Exception:

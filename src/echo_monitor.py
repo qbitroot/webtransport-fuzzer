@@ -12,6 +12,10 @@ from boofuzz.monitors.base_monitor import BaseMonitor
 
 logger = logging.getLogger(__name__)
 
+class ServerDownError(Exception):
+    """Raised when the target server is unreachable/down."""
+    pass
+
 FAILURES_DIR = "failures"
 os.makedirs(FAILURES_DIR, exist_ok=True)
 
@@ -93,21 +97,20 @@ class EchoCompareMonitor(BaseMonitor):
                         probe_conn.close()
                         
                         if probe_success:
-                             fuzz_data_logger.log_check("Probe PASSED: Server is alive. Current connection was just closed.")
-                             return True
+                             fuzz_data_logger.log_fail("Probe PASSED: Server is alive, but connection was closed unexpectedly (Possible Worker Panic).")
+                             save_failure(sent, b"")
+                             return False # Fail this test case, but continue fuzzing
                         else:
                              fuzz_data_logger.log_fail("Probe FAILED: Server unresponsive to fresh connection!")
                              save_failure(sent, b"")
-                             # Log crash but continue gracefully
-                             fuzz_data_logger.log_error("CRASH DETECTED: Server unreachable. Saved failure case.")
-                             return False
+                             raise ServerDownError("Server is down (Probe failed)")
                              
+                    except ServerDownError:
+                        raise
                     except Exception as probe_err:
                         fuzz_data_logger.log_fail(f"Probe Exception: {probe_err}. SERVER DOWN.")
                         save_failure(sent, b"")
-                        # Log crash but continue gracefully instead of crashing
-                        fuzz_data_logger.log_error(f"CRASH DETECTED: Server probe failed. Saved failure case.")
-                        return False
+                        raise ServerDownError(f"Server is down (Probe exception: {probe_err})")
 
             # Case 2: Response received
             expected_payload = None
@@ -134,6 +137,8 @@ class EchoCompareMonitor(BaseMonitor):
 
             return True
 
+        except ServerDownError:
+            raise
         except Exception as e:
             fuzz_data_logger.log_error(f"Exception in EchoCompareMonitor.post_send: {e}")
             logger.exception("EchoCompareMonitor exception")
