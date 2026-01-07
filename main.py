@@ -20,7 +20,6 @@ from src.boofuzz_definitions import (
     define_capsule_drain,
     define_capsule_close,
     define_stream_dos,
-    define_stream_dos,
     define_valid_webtransport_packet,
     define_capsule_reset_stream,
     define_capsule_stop_sending,
@@ -71,12 +70,12 @@ FUZZ_MODES = {
         "send_mode": "capsule",
         "desc": "DRAIN_WEBTRANSPORT_SESSION Capsule (0x78AE)",
     },
-    "wt_close": {
+    "close": {
         "define_func": define_capsule_close,
         "send_mode": "capsule",
         "desc": "CLOSE_WEBTRANSPORT_SESSION Capsule (0x2843)",
     },
-    "wt_stream_dos": {
+    "stream_dos": {
         "define_func": define_stream_dos,
         "send_mode": "unidirectional",
         "desc": "DoS: 10k Small Streams (Resource Exhaustion)",
