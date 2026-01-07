@@ -7,6 +7,7 @@ import sys
 import time
 
 from boofuzz import Session, Target, FuzzLoggerText
+from boofuzz.fuzz_logger_db import FuzzLoggerDb
 
 from src.fuzzer_connection import WebTransportConnection
 from src.echo_monitor import EchoCompareMonitor, ServerDownError
@@ -239,11 +240,16 @@ def main():
         echo_monitor = EchoCompareMonitor(crash_on_mismatch=True)
         target = Target(connection=connection, monitors=[echo_monitor])
 
+        # Database logger
+        db_filename = os.path.join("boofuzz-results", f"run_{int(time.time())}.db")
+        db_logger = FuzzLoggerDb(db_filename=db_filename)
+        logger.info(f"Logging results to {db_filename}")
+
         session = Session(
             target=target,
-            fuzz_loggers=[FuzzLoggerText()],
+            fuzz_loggers=[FuzzLoggerText(), db_logger],
             sleep_time=0.0,
-            restart_sleep_time=2.0,
+            restart_sleep_time=0.0, # Removed delay as requested
             reuse_target_connection=False,
             index_start=args.start_index,
             index_end=args.end_index,

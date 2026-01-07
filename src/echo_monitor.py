@@ -97,9 +97,11 @@ class EchoCompareMonitor(BaseMonitor):
                         probe_conn.close()
                         
                         if probe_success:
-                             fuzz_data_logger.log_fail("Probe PASSED: Server is alive, but connection was closed unexpectedly (Possible Worker Panic).")
-                             save_failure(sent, b"")
-                             return False # Fail this test case, but continue fuzzing
+                             # User requested to ignore "false positive" worker panic / checks.
+                             # If server is ALIVE, we count it as a pass, but log the closed connection.
+                             fuzz_data_logger.log_info("Probe PASSED: Server is alive, but connection was closed (Graceful or Worker Panic). Treated as PASS.")
+                             # save_failure(sent, b"") # Optional: save if you want to inspect closed connections
+                             return True 
                         else:
                              fuzz_data_logger.log_fail("Probe FAILED: Server unresponsive to fresh connection!")
                              save_failure(sent, b"")
