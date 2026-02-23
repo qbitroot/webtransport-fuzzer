@@ -6,8 +6,7 @@ import os
 import sys
 import time
 
-from boofuzz import Session, Target, FuzzLoggerText
-from boofuzz.fuzz_logger_db import FuzzLoggerDb
+from boofuzz import Session, Target
 
 from src.fuzzer_connection import WebTransportConnection
 from src.echo_monitor import EchoCompareMonitor, ServerDownError
@@ -50,6 +49,18 @@ def main():
         type=int,
         help="Stop fuzzing after this test case index"
     )
+    parser.add_argument(
+        "--server-cmd",
+        type=str,
+        default=None,
+        help="Shell command to launch the target server as a subprocess (e.g. 'python server.py cert.pem key.pem')"
+    )
+    parser.add_argument(
+        "--server-startup-delay",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after launching server before fuzzing (default: 1.0)"
+    )
     args = parser.parse_args()
 
     target_url = args.url
@@ -64,6 +75,26 @@ def main():
     """
     )
     logger.info("Target: %s", target_url)
+
+    # ---- Server subprocess management ----
+    server_manager = None
+    log_db = None
+
+    if args.server_cmd:
+        from src.server_manager import ServerManager
+        from src.log_db import LogDB
+
+        server_manager = ServerManager(
+            cmd=args.server_cmd,
+            startup_delay=args.server_startup_delay,
+        )
+        server_manager.start()
+
+        # Log DB alongside boofuzz results
+        os.makedirs("boofuzz-results", exist_ok=True)
+        log_db_path = os.path.join("boofuzz-results", f"server_logs_{int(time.time())}.db")
+        log_db = LogDB(log_db_path)
+        logger.info("Server log database: %s", log_db_path)
 
     if args.no_fuzz:
         logger.info("Running in VALIDATION MODE (--no-fuzz)")
@@ -95,17 +126,18 @@ def main():
             send_mode="capsule"
         )
         
-        echo_monitor = EchoCompareMonitor(crash_on_mismatch=True)
-        target = Target(connection=connection, monitors=[echo_monitor])
+        monitors = [EchoCompareMonitor(crash_on_mismatch=True)]
 
-        # Database logger
-        db_filename = os.path.join("boofuzz-results", f"run_{int(time.time())}.db")
-        db_logger = FuzzLoggerDb(db_filename=db_filename)
-        logger.info(f"Logging results to {db_filename}")
+        # Add server log monitor if server is managed
+        if server_manager and log_db:
+            from src.server_log_monitor import ServerLogMonitor
+            monitors.append(ServerLogMonitor(server_manager, log_db))
+
+        target = Target(connection=connection, monitors=monitors)
 
         session = Session(
             target=target,
-            fuzz_loggers=[FuzzLoggerText(), db_logger],
+            fuzz_loggers=[],  # Web GUI at :26000 handles its own DB
             sleep_time=0.0,
             restart_sleep_time=0.0,
             reuse_target_connection=False,
@@ -133,6 +165,11 @@ def main():
             logger.exception("Fuzzing encountered an unexpected error")
         finally:
             logger.info("Fuzzing session finished")
+            if log_db:
+                logger.info("Server logs saved to: %s", log_db_path)
+                log_db.close()
+            if server_manager:
+                server_manager.stop()
 
 
 if __name__ == "__main__":
