@@ -7,10 +7,15 @@ Log output is deduplicated into `log_groups` — each unique combination of
 server output lines is stored once. Multiple test cases that produce the
 same output all point to the same log_group_id, making it trivial to
 group by failure mode.
+
+No parsing or validation is performed on the server output. The WTFUZZ
+structured log format (``WTFUZZ|EVENT|k=v|...``) is already self-describing,
+so lines are stored verbatim. If the server emits unexpected output (panics,
+exceptions, etc.), it is captured alongside the structured lines, making
+anomalies immediately visible by their deviation from the expected pattern.
 """
 
 import hashlib
-import json
 import logging
 import sqlite3
 import time
@@ -47,8 +52,7 @@ class LogDB:
             CREATE TABLE IF NOT EXISTS log_groups (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 fingerprint TEXT NOT NULL UNIQUE,
-                raw_text    TEXT NOT NULL,
-                events_json TEXT
+                raw_text    TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS test_cases (
@@ -89,55 +93,22 @@ class LogDB:
     def _get_or_create_log_group(self, lines: list[str]) -> int:
         """Find or create a log_group for the given output lines."""
         raw_text = "\n".join(lines)
-        fingerprint = hashlib.sha256(raw_text.encode("utf-8", errors="replace")).hexdigest()
+        fingerprint = hashlib.sha256(
+            raw_text.encode("utf-8", errors="replace")
+        ).hexdigest()
 
-        # Check if this fingerprint already exists
         row = self._conn.execute(
             "SELECT id FROM log_groups WHERE fingerprint = ?", (fingerprint,)
         ).fetchone()
         if row:
             return row[0]
 
-        # Parse structured events
-        events = []
-        for line in lines:
-            event, kv_json = self._parse_line(line)
-            if event:
-                events.append({"event": event, **(json.loads(kv_json) if kv_json else {})})
-
-        events_json = json.dumps(events) if events else None
-
         cur = self._conn.execute(
-            "INSERT INTO log_groups (fingerprint, raw_text, events_json) VALUES (?, ?, ?)",
-            (fingerprint, raw_text, events_json),
+            "INSERT INTO log_groups (fingerprint, raw_text) VALUES (?, ?)",
+            (fingerprint, raw_text),
         )
         self._conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
-
-    @staticmethod
-    def _parse_line(raw_line: str) -> tuple[str | None, str | None]:
-        """
-        Parse a WTFUZZ| structured line.
-
-        Format: WTFUZZ|EVENT|key1=val1|key2=val2|...
-        Returns (event, kv_json) or (None, None) for non-WTFUZZ lines.
-        """
-        if not raw_line.startswith(WTFUZZ_PREFIX):
-            return None, None
-
-        parts = raw_line[len(WTFUZZ_PREFIX):].split("|")
-        if not parts:
-            return None, None
-
-        event = parts[0]
-        kv = {}
-        for part in parts[1:]:
-            if "=" in part:
-                k, v = part.split("=", 1)
-                kv[k] = v
-
-        kv_json = json.dumps(kv) if kv else None
-        return event, kv_json
 
     def close(self):
         """Close the database connection."""

@@ -12,7 +12,7 @@ Tested against a local server (see server directory), based on [w3c/webtransport
 
 ## Logging Standard
 
-The fuzzer uses a two-layer logging system: **structured WTFUZZ lines** emitted by the server, and a **SQLite log database** that correlates them with fuzzer test cases.
+The fuzzer uses a two-layer logging system: **structured WTFUZZ lines** emitted by the server, and a **SQLite log database** that stores them verbatim and correlates them with fuzzer test cases.
 
 ### WTFUZZ Structured Log Format
 
@@ -22,7 +22,7 @@ All instrumented servers must emit structured log lines to **stdout** in this pi
 WTFUZZ|EVENT|key1=val1|key2=val2|...
 ```
 
-- **Prefix**: Every structured line starts with `WTFUZZ|` (defined as `WTFUZZ_PREFIX` in `src/log_db.py:21`).
+- **Prefix**: Every structured line starts with `WTFUZZ|` (defined as `WTFUZZ_PREFIX` in `src/log_db.py:26`).
 - **EVENT**: A short, uppercase event name (see table below).
 - **Key-value pairs**: Zero or more `key=value` segments, separated by `|`.
 - **Flush**: Lines must be flushed immediately (`flush=True`) so the monitor can read them without delay.
@@ -48,14 +48,15 @@ These events are language-agnostic and derived from the WebTransport spec, so an
 
 `LogDB` (`src/log_db.py`) stores all captured output in a normalized SQLite database with WAL mode enabled.
 
+Server output is **stored verbatim** — no parsing or validation is performed. Because the WTFUZZ format is already structured and self-describing, the raw lines *are* the structured data. This also means that if the server emits unexpected output (panics, stack traces, assertion failures), it is captured alongside the structured lines, making anomalies immediately visible by their deviation from the normal pattern.
+
 #### Schema
 
 ```
 log_groups
   id            INTEGER PRIMARY KEY
   fingerprint   TEXT UNIQUE          -- SHA-256 of the joined raw lines
-  raw_text      TEXT                 -- full server output for this group
-  events_json   TEXT                 -- parsed WTFUZZ events as JSON array
+  raw_text      TEXT                 -- full server output for this group (stored as-is)
 
 test_cases
   id            INTEGER PRIMARY KEY
@@ -66,8 +67,6 @@ test_cases
 ```
 
 **Deduplication**: Server output is fingerprinted (SHA-256 of the concatenated lines). If multiple test cases produce identical server output, they all reference the same `log_group` row. This makes it trivial to group test cases by failure mode.
-
-**Event parsing**: Each `WTFUZZ|` line is parsed into `{"event": "...", "key": "val", ...}` objects and stored as a JSON array in `events_json`.
 
 ### Server Log Monitor
 
@@ -84,7 +83,7 @@ To instrument a new server for this fuzzer:
 
 1. Print `WTFUZZ|EVENT|key=val|...` lines to **stdout**, flushed immediately.
 2. Send all other logging to **stderr**.
-3. Use the event names from the catalog above so the monitor and database can parse them consistently.
+3. Use the event names from the catalog above for consistency across implementations.
 
 ---
 
