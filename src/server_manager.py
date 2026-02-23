@@ -23,7 +23,7 @@ class ServerManager:
     Manages a server subprocess with real-time stdout+stderr capture.
 
     Usage:
-        mgr = ServerManager("uv run python server/server.py cert.pem key.pem")
+        mgr = ServerManager("uv run python server/aioquic/server.py cert.pem key.pem")
         mgr.start()          # launches process, waits for startup delay
         ...
         lines = mgr.drain_lines()  # get all buffered output since last drain

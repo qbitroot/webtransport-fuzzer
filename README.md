@@ -2,7 +2,10 @@
 
 Boofuzz-based WebTransport protocol fuzzer.
 
-Tested against a local server (see server directory), based on [w3c/webtransport ipv4_echo_server.py](https://github.com/w3c/webtransport/blob/main/samples/echo/py-server/ipv4_echo_server.py).
+Tested against local server implementations in the `server/` directory:
+
+- **`server/aioquic`** — Python echo server based on [w3c/webtransport ipv4_echo_server.py](https://github.com/w3c/webtransport/blob/main/samples/echo/py-server/ipv4_echo_server.py), using [aioquic](https://github.com/aiortc/aioquic).
+- **`server/wtransport`** — Rust WebTransport library ([wtransport](https://github.com/BiagioFesta/wtransport)).
 
 ## Current progress
 
