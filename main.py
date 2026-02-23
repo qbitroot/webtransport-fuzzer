@@ -26,40 +26,42 @@ os.makedirs(FAILURES_DIR, exist_ok=True)
 def main():
     parser = argparse.ArgumentParser(description="WebTransport One-Shot Fuzzer")
     parser.add_argument("--url", default="https://0.0.0.0:6161/echo", help="Target URL")
-    parser.add_argument("--no-fuzz", action="store_true", help="Run in validation mode (health check only)")
+    parser.add_argument(
+        "--no-fuzz",
+        action="store_true",
+        help="Run in validation mode (health check only)",
+    )
     parser.add_argument(
         "--mode",
         choices=["oneshot"],
         default="oneshot",
-        help="Fuzzing mode (default: oneshot)"
+        help="Fuzzing mode (default: oneshot)",
     )
     parser.add_argument(
         "--fuzz-payload",
         action="store_true",
-        help="Also fuzz payload content (default: only fuzz packet structure)"
+        help="Also fuzz payload content (default: only fuzz packet structure)",
     )
     parser.add_argument(
         "--start-index",
         type=int,
         default=1,
-        help="Start fuzzing from this test case index"
+        help="Start fuzzing from this test case index",
     )
     parser.add_argument(
-        "--end-index",
-        type=int,
-        help="Stop fuzzing after this test case index"
+        "--end-index", type=int, help="Stop fuzzing after this test case index"
     )
     parser.add_argument(
         "--server-cmd",
         type=str,
         default=None,
-        help="Shell command to launch the target server as a subprocess (e.g. 'python server.py cert.pem key.pem')"
+        help="Shell command to launch the target server as a subprocess (e.g. 'python server.py cert.pem key.pem')",
     )
     parser.add_argument(
         "--server-startup-delay",
         type=float,
         default=1.0,
-        help="Seconds to wait after launching server before fuzzing (default: 1.0)"
+        help="Seconds to wait after launching server before fuzzing (default: 1.0)",
     )
     args = parser.parse_args()
 
@@ -92,45 +94,48 @@ def main():
 
         # Log DB alongside boofuzz results
         os.makedirs("boofuzz-results", exist_ok=True)
-        log_db_path = os.path.join("boofuzz-results", f"server_logs_{int(time.time())}.db")
+        log_db_path = os.path.join(
+            "boofuzz-results", f"server_logs_{int(time.time())}.db"
+        )
         log_db = LogDB(log_db_path)
         logger.info("Server log database: %s", log_db_path)
 
     if args.no_fuzz:
         logger.info("Running in VALIDATION MODE (--no-fuzz)")
         connection = WebTransportConnection(target_url, timeout=3.0)
-        
+
         try:
             connection.open()
 
             logger.info("Sending Health Check (Standard Probe)...")
             success = connection.send_health_check()
-            
+
             if success:
                 logger.info("Validation SUCCESS: Server responded to health check.")
             else:
-                logger.error("Validation FAILED: Server did not respond to health check.")
-            
+                logger.error(
+                    "Validation FAILED: Server did not respond to health check."
+                )
+
             connection.close()
         except Exception:
             logger.exception("Validation encountered an error")
-            
+
     else:
         logger.info("Running in ONE-SHOT FUZZING MODE")
         logger.info("Press Ctrl+C to stop")
 
         # Single connection — always capsule mode (writes to CONNECT stream)
         connection = WebTransportConnection(
-            target_url, 
-            timeout=3.0, 
-            send_mode="capsule"
+            target_url, timeout=3.0, send_mode="capsule"
         )
-        
+
         monitors = [EchoCompareMonitor(crash_on_mismatch=True)]
 
         # Add server log monitor if server is managed
         if server_manager and log_db:
             from src.server_log_monitor import ServerLogMonitor
+
             monitors.append(ServerLogMonitor(server_manager, log_db))
 
         target = Target(connection=connection, monitors=monitors)
@@ -138,6 +143,7 @@ def main():
         session = Session(
             target=target,
             fuzz_loggers=[],  # Web GUI at :26000 handles its own DB
+            db_filename=":memory:",  # Don't write boofuzz's default run-*.db to disk
             sleep_time=0.0,
             restart_sleep_time=0.0,
             reuse_target_connection=False,
@@ -147,8 +153,7 @@ def main():
 
         # Single boofuzz node for one-shot capsule fuzzing
         msg = define_oneshot_capsule(
-            session_name="wt_oneshot",
-            fuzz_payload=args.fuzz_payload
+            session_name="wt_oneshot", fuzz_payload=args.fuzz_payload
         )
         session.connect(msg)
 
