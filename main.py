@@ -38,9 +38,9 @@ def main():
         help="Fuzzing mode (default: oneshot)",
     )
     parser.add_argument(
-        "--fuzz-payload",
+        "--no-healthcheck",
         action="store_true",
-        help="Also fuzz payload content (default: only fuzz packet structure)",
+        help="Disable health checks after each test case",
     )
     parser.add_argument(
         "--start-index",
@@ -130,7 +130,9 @@ def main():
             target_url, timeout=3.0, send_mode="capsule"
         )
 
-        monitors = [EchoCompareMonitor(crash_on_mismatch=True)]
+        monitors = []
+        if not args.no_healthcheck:
+            monitors.append(EchoCompareMonitor(crash_on_mismatch=True))
 
         # Add server log monitor if server is managed
         if server_manager and log_db:
@@ -152,9 +154,7 @@ def main():
         )
 
         # Single boofuzz node for one-shot capsule fuzzing
-        msg = define_oneshot_capsule(
-            session_name="wt_oneshot", fuzz_payload=args.fuzz_payload
-        )
+        msg = define_oneshot_capsule(session_name="wt_oneshot")
         session.connect(msg)
 
         try:

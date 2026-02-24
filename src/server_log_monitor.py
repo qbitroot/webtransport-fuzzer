@@ -5,6 +5,7 @@ Wires together ServerManager (line capture) and LogDB (storage) on every test ca
 """
 
 import logging
+import time
 
 from boofuzz.monitors.base_monitor import BaseMonitor
 
@@ -22,11 +23,14 @@ class ServerLogMonitor(BaseMonitor):
     3. Logs a summary to boofuzz's fuzz_data_logger
     """
 
-    def __init__(self, server_manager: ServerManager, log_db: LogDB):
+    def __init__(
+        self, server_manager: ServerManager, log_db: LogDB, delay_ms: int = 250
+    ):
         super().__init__()
         self._server = server_manager
         self._db = log_db
         self._current_test_index = 0
+        self._delay_secs = delay_ms / 1000.0
 
     def post_start_target(self, target, fuzz_data_logger, session, *args, **kwargs):
         """Called after target connection is opened. Drain any startup noise."""
@@ -34,11 +38,15 @@ class ServerLogMonitor(BaseMonitor):
 
     def pre_send(self, target, fuzz_data_logger, session, *args, **kwargs):
         """Track the current test case index before sending."""
-        self._current_test_index = session.mutant_index if hasattr(session, 'mutant_index') else 0
+        self._current_test_index = (
+            session.mutant_index if hasattr(session, "mutant_index") else 0
+        )
         # Drain any lines from between test cases (e.g. from health checks)
         self._server.drain_lines()
 
-    def post_send(self, target, fuzz_data_logger, session, mutated_data=None, *args, **kwargs):
+    def post_send(
+        self, target, fuzz_data_logger, session, mutated_data=None, *args, **kwargs
+    ):
         """
         After each fuzzed send, drain server output and store in DB.
         """
@@ -53,6 +61,9 @@ class ServerLogMonitor(BaseMonitor):
                     sent_data = conn._last_sent_data
             except Exception:
                 pass
+
+        # Give the server a moment to process the payload and log panics
+        time.sleep(self._delay_secs)
 
         # Drain all server output since the last drain
         lines = self._server.drain_lines()

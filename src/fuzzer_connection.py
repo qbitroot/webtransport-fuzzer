@@ -23,14 +23,16 @@ class WebTransportConnection(ITargetConnection):
 
     It stores last sent/received data on the object, so the monitor
     can inspect and compare them.
-    
+
     Supports multiple send modes:
     - 'unidirectional': Raw unidirectional stream (default)
     - 'bidirectional': Bidirectional stream with response
     - 'datagram': Unreliable datagram
     """
 
-    def __init__(self, url: str, timeout: float = 1.0, send_mode: str = "unidirectional"):
+    def __init__(
+        self, url: str, timeout: float = 1.0, send_mode: str = "unidirectional"
+    ):
         self.url = url
         self.timeout = timeout
         self._send_mode = send_mode
@@ -45,8 +47,6 @@ class WebTransportConnection(ITargetConnection):
         self.port = parsed.port or 443
         self.path = parsed.path or "/"
         self.authority = f"{self.host}:{self.port}"
-
-        logger.info("WebTransportConnection initialized for %s (mode: %s)", url, send_mode)
 
     def set_send_mode(self, mode: str):
         """Update the send mode dynamically."""
@@ -66,7 +66,7 @@ class WebTransportConnection(ITargetConnection):
             logger.info("Connection open")
         except Exception:
             # Clean logging here is redundant if we re-raise wrapped errors
-            # logger.exception("Failed to open connection") 
+            # logger.exception("Failed to open connection")
             if self._loop:
                 try:
                     self._loop.close()
@@ -90,19 +90,18 @@ class WebTransportConnection(ITargetConnection):
         )
         try:
             self._protocol = await asyncio.wait_for(
-                self._client_context.__aenter__(), 
-                timeout=self.timeout
+                self._client_context.__aenter__(), timeout=self.timeout
             )
             await asyncio.wait_for(
                 self._protocol.establish_session(self.authority, self.path),
-                timeout=self.timeout
+                timeout=self.timeout,
             )
         except asyncio.TimeoutError:
             raise ConnectionError("Server Unreachable (Timeout)") from None
         except Exception as e:
             # Ensure we clean up the context if something else broke
             try:
-                 pass
+                pass
             except:
                 pass
             raise ConnectionError(f"Server Unreachable (Error: {e})") from e
@@ -112,7 +111,9 @@ class WebTransportConnection(ITargetConnection):
         logger.info("Closing WebTransport connection")
         if self._loop and self._client_context:
             try:
-                self._loop.run_until_complete(self._client_context.__aexit__(None, None, None))
+                self._loop.run_until_complete(
+                    self._client_context.__aexit__(None, None, None)
+                )
             except Exception:
                 logger.exception("Error during client context exit")
             finally:
@@ -140,8 +141,10 @@ class WebTransportConnection(ITargetConnection):
 
         target_len = len(data)
         preview = data[:100] if target_len > 100 else data
-        logger.debug("Sending %d bytes via %s: %s", target_len, self._send_mode, preview)
-        
+        logger.debug(
+            "Sending %d bytes via %s: %s", target_len, self._send_mode, preview
+        )
+
         self._last_sent_data = data
         self._last_received_data = None
 
@@ -191,14 +194,14 @@ class WebTransportConnection(ITargetConnection):
         """
         if not self._loop or not self._protocol:
             return b""
-        
+
         try:
             data = self._loop.run_until_complete(self._async_recv(timeout=0.1))
             if data:
                 # Ensure the monitor can see what we received, even if Boofuzz target doesn't set it in feature_check
                 self._last_received_data = data[:max_bytes]
                 return self._last_received_data
-            
+
             self._last_received_data = b""
             return b""
         except Exception as e:
@@ -209,32 +212,32 @@ class WebTransportConnection(ITargetConnection):
         """Async helper to fetch next message from protocol queue."""
         if not self._protocol:
             return b""
-        
+
         # Accumulate data until timeout expiration (or small silence)
         # For fuzzing, we often want "everything sent in response to my input"
         buffer = bytearray()
         end_time = asyncio.get_event_loop().time() + timeout
-        
+
         while True:
             remaining = end_time - asyncio.get_event_loop().time()
             if remaining <= 0:
                 break
-            
+
             try:
                 # Use a shorter wait for subsequent chunks
                 current_wait = remaining
                 if len(buffer) > 0:
-                     # If we already have data, wait less for more (aggregating)
-                     current_wait = min(0.1, remaining)
+                    # If we already have data, wait less for more (aggregating)
+                    current_wait = min(0.1, remaining)
 
                 queue = self._protocol._received_messages
                 type_, *args = await asyncio.wait_for(queue.get(), timeout=current_wait)
-                
-                if type_ == 'stream':
+
+                if type_ == "stream":
                     stream_id, data = args
                     logger.debug("Async Recv: Stream %d data: %s", stream_id, data)
                     buffer.extend(data)
-                elif type_ == 'datagram':
+                elif type_ == "datagram":
                     data = args[0]
                     logger.debug("Async Recv: Datagram: %s", data)
                     buffer.extend(data)
@@ -243,14 +246,14 @@ class WebTransportConnection(ITargetConnection):
             except Exception as e:
                 logger.warning("Async recv exception: %s", e)
                 break
-        
+
         return bytes(buffer)
 
     def send_health_check(self) -> bool:
         """
         Send a synchronous health check (bidirectional stream ping)
         to verify if the server is still alive and responsive.
-        
+
         Returns:
             True if health check succeeds (server responded), False otherwise.
         """
@@ -261,7 +264,9 @@ class WebTransportConnection(ITargetConnection):
         async def _health_check():
             try:
                 # Send explicit health check payload
-                sid, response = await self._protocol.send_bidirectional_stream(b"HEALTHCHECK", timeout=1.0)
+                sid, response = await self._protocol.send_bidirectional_stream(
+                    b"HEALTHCHECK", timeout=1.0
+                )
                 if response:
                     logger.debug("Health check response: %s", response)
                     return True

@@ -86,8 +86,9 @@ async fn handle_connection_impl(incoming_session: IncomingSession) -> Result<()>
 
     let connection = session_request.accept().await?;
 
-    // Use the stable_id of the underlying QUIC connection as a session identifier.
-    let session_id = connection.stable_id();
+    // Retrieve the actual HTTP/3 session ID (the stream ID of the CONNECT request)
+    // so it matches across test runs (unlike pointers or process-lifetime counters).
+    let session_id = connection.session_id().into_u64();
 
     wtfuzz!("SESSION_OPEN", session_id = session_id);
 
@@ -103,7 +104,7 @@ async fn handle_connection_impl(incoming_session: IncomingSession) -> Result<()>
 async fn run_session(
     connection: &wtransport::Connection,
     buffer: &mut Box<[u8]>,
-    session_id: usize,
+    session_id: u64,
 ) -> Result<()> {
     loop {
         tokio::select! {
