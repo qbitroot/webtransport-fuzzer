@@ -38,6 +38,7 @@ macro_rules! wtfuzz {
             line.push_str(&format!("{}={}", stringify!($key), $val));
         )*
         println!("{}", line);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }};
 }
 
@@ -60,7 +61,9 @@ async fn main() -> Result<()> {
 
     for id in 0.. {
         let incoming_session = server.accept().await;
-        handle_connection(incoming_session).instrument(info_span!("Connection", id)).await;
+        tokio::spawn(
+            handle_connection(incoming_session).instrument(info_span!("Connection", id))
+        );
     }
 
     Ok(())
