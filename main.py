@@ -63,6 +63,12 @@ def main():
         default=1.0,
         help="Seconds to wait after launching server before fuzzing (default: 1.0)",
     )
+    parser.add_argument(
+        "--server-log-delay",
+        type=int,
+        default=250,
+        help="Milliseconds to wait for server logs after each test case (default: 250)",
+    )
     args = parser.parse_args()
 
     target_url = args.url
@@ -138,7 +144,9 @@ def main():
         if server_manager and log_db:
             from src.server_log_monitor import ServerLogMonitor
 
-            monitors.append(ServerLogMonitor(server_manager, log_db))
+            monitors.append(
+                ServerLogMonitor(server_manager, log_db, delay_ms=args.server_log_delay)
+            )
 
         target = Target(connection=connection, monitors=monitors)
 

@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
 
     for id in 0.. {
         let incoming_session = server.accept().await;
-        tokio::spawn(handle_connection(incoming_session).instrument(info_span!("Connection", id)));
+        handle_connection(incoming_session).instrument(info_span!("Connection", id)).await;
     }
 
     Ok(())

@@ -68,6 +68,25 @@ class ServerLogMonitor(BaseMonitor):
         # Drain all server output since the last drain
         lines = self._server.drain_lines()
 
+        # Filter out stray WTFUZZ lines from previous testcases (like health checks or slow closes).
+        # We find the LAST SESSION_OPEN, and drop any WTFUZZ line before it, but we KEEP panics.
+        last_open_idx = -1
+        for i, line in enumerate(lines):
+            if line.startswith(f"{WTFUZZ_PREFIX}SESSION_OPEN"):
+                last_open_idx = i
+
+        if last_open_idx != -1:
+            filtered_lines = []
+            for i, line in enumerate(lines):
+                if i < last_open_idx:
+                    # Keep raw panics/errors from previous late-terminating testcases,
+                    # but drop the stray WTFUZZ structured lines (e.g. SESSION_CLOSE).
+                    if not line.startswith(WTFUZZ_PREFIX):
+                        filtered_lines.append(line)
+                else:
+                    filtered_lines.append(line)
+            lines = filtered_lines
+
         # Store in DB (log_group deduplication handled internally)
         self._db.record_test_case(
             index=self._current_test_index,
