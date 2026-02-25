@@ -36,7 +36,12 @@ from aioquic.h3.events import (
 )
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import stream_is_unidirectional
-from aioquic.quic.events import ProtocolNegotiated, StreamReset, QuicEvent
+from aioquic.quic.events import (
+    ConnectionTerminated,
+    ProtocolNegotiated,
+    StreamReset,
+    QuicEvent,
+)
 
 BIND_ADDRESS = "0.0.0.0"
 BIND_PORT = 6161
@@ -58,6 +63,7 @@ logger = logging.getLogger(__name__)
 #   ECHO              - Echo response sent
 #   STREAM_RESET      - Stream reset received
 # ---------------------------------------------------------------------------
+
 
 def wtfuzz(event: str, **kv):
     """Print a WTFUZZ structured log line to stdout (flushed immediately)."""
@@ -102,10 +108,10 @@ class EchoHandler:
                 else:
                     response_id = event.stream_id
                 payload = self._payloads[event.stream_id]
-                self._http._quic.send_stream_data(
-                    response_id, payload, end_stream=True
+                self._http._quic.send_stream_data(response_id, payload, end_stream=True)
+                stream_type = (
+                    "uni" if stream_is_unidirectional(event.stream_id) else "bidi"
                 )
-                stream_type = "uni" if stream_is_unidirectional(event.stream_id) else "bidi"
                 wtfuzz("ECHO", type=stream_type, stream_id=response_id)
                 self.stream_closed(event.stream_id)
 
@@ -117,7 +123,6 @@ class EchoHandler:
 
 
 class WebTransportProtocol(QuicConnectionProtocol):
-
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._http: Optional[H3Connection] = None
@@ -127,8 +132,14 @@ class WebTransportProtocol(QuicConnectionProtocol):
         if isinstance(event, ProtocolNegotiated):
             self._http = H3Connection(self._quic, enable_webtransport=True)
         elif isinstance(event, StreamReset) and self._handler is not None:
-            wtfuzz("STREAM_RESET", stream_id=event.stream_id, error_code=event.error_code)
+            wtfuzz(
+                "STREAM_RESET", stream_id=event.stream_id, error_code=event.error_code
+            )
             self._handler.stream_closed(event.stream_id)
+        elif isinstance(event, ConnectionTerminated):
+            if self._handler:
+                wtfuzz("SESSION_CLOSE", session_id=self._handler._session_id)
+                self._handler = None
 
         if self._http is not None:
             for h3_event in self._http.handle_event(event):
@@ -173,11 +184,6 @@ class WebTransportProtocol(QuicConnectionProtocol):
         self._http.send_headers(
             stream_id=stream_id, headers=headers, end_stream=end_stream
         )
-
-    def connection_lost(self, exc):
-        if self._handler:
-            wtfuzz("SESSION_CLOSE", session_id=self._handler._session_id)
-        super().connection_lost(exc)
 
 
 if __name__ == "__main__":
