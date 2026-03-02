@@ -19,23 +19,23 @@ from aioquic.quic.configuration import QuicConfiguration
 from src.webtransport_client import WebTransportClient
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 
 async def interactive_mode(client: WebTransportClient):
     """Interactive mode for sending messages."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("WebTransport Echo Client - Interactive Mode")
-    print("="*60)
+    print("=" * 60)
     print("Commands:")
     print("  d <message>  - Send datagram")
     print("  u <message>  - Send unidirectional stream")
     print("  b <message>  - Send bidirectional stream")
+    print("  x <hex>      - Send raw capsule (hex bytes on CONNECT stream)")
     print("  q            - Quit")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
     while True:
         try:
@@ -43,38 +43,53 @@ async def interactive_mode(client: WebTransportClient):
                 None, input, ">>> "
             )
             command = command.strip()
-            
+
             if not command:
                 continue
-            
-            if command.startswith('q'):
+
+            if command.startswith("q"):
                 print("Exiting...")
                 break
-            
-            parts = command.split(' ', 1)
+
+            parts = command.split(" ", 1)
             if len(parts) < 2:
-                print("Invalid command. Use: <d|u|b> <message>")
+                print("Invalid command. Use: <d|u|b|x> <message>")
                 continue
-            
+
             cmd_type, message = parts
-            data = message.encode('utf-8')
-            
-            if cmd_type == 'd':
-                client.send_datagram(data)
-                logger.info("Sent datagram: %s", message)
-            elif cmd_type == 'u':
-                await client.send_unidirectional_stream(data)
-                logger.info("Sent unidirectional stream: %s", message)
-            elif cmd_type == 'b':
-                stream_id, response = await client.send_bidirectional_stream(data)
-                logger.info("Sent bidirectional stream: %s", message)
-                if response:
-                    logger.info("Received response: %s", response.decode('utf-8', errors='ignore'))
+
+            if cmd_type == "x":
+                # Raw capsule: parse hex string into bytes, send on CONNECT stream
+                hex_str = message.replace(" ", "").replace("0x", "").replace(",", "")
+                try:
+                    data = bytes.fromhex(hex_str)
+                except ValueError as e:
+                    print(f"Invalid hex: {e}")
+                    continue
+                client.send_capsule(data)
+                logger.info("Sent raw capsule (%d bytes): %s", len(data), data.hex())
             else:
-                print(f"Unknown command: {cmd_type}")
-            
+                data = message.encode("utf-8")
+
+                if cmd_type == "d":
+                    client.send_datagram(data)
+                    logger.info("Sent datagram: %s", message)
+                elif cmd_type == "u":
+                    await client.send_unidirectional_stream(data)
+                    logger.info("Sent unidirectional stream: %s", message)
+                elif cmd_type == "b":
+                    stream_id, response = await client.send_bidirectional_stream(data)
+                    logger.info("Sent bidirectional stream: %s", message)
+                    if response:
+                        logger.info(
+                            "Received response: %s",
+                            response.decode("utf-8", errors="ignore"),
+                        )
+                else:
+                    print(f"Unknown command: {cmd_type}")
+
             await asyncio.sleep(0.1)
-            
+
         except EOFError:
             break
         except Exception as e:
@@ -83,55 +98,66 @@ async def interactive_mode(client: WebTransportClient):
 
 async def demo_mode(client: WebTransportClient):
     """Automated demo mode."""
-    logger.info("\n" + "="*60)
+    logger.info("\n" + "=" * 60)
     logger.info("Running automated demo...")
-    logger.info("="*60 + "\n")
-    
+    logger.info("=" * 60 + "\n")
+
     # Test 1: Send a datagram
     logger.info("Test 1: Sending datagram...")
     client.send_datagram(b"Hello via datagram!")
     await asyncio.sleep(0.5)
-    
+
     # Test 2: Send unidirectional stream
     logger.info("\nTest 2: Sending unidirectional stream...")
     await client.send_unidirectional_stream(b"Hello via unidirectional stream!")
     await asyncio.sleep(0.5)
-    
+
     # Test 3: Send bidirectional stream
     logger.info("\nTest 3: Sending bidirectional stream...")
-    stream_id, response = await client.send_bidirectional_stream(b"Hello via bidirectional stream!")
+    stream_id, response = await client.send_bidirectional_stream(
+        b"Hello via bidirectional stream!"
+    )
     if response:
-        logger.info("Received response: %s", response.decode('utf-8', errors='ignore'))
+        logger.info("Received response: %s", response.decode("utf-8", errors="ignore"))
     await asyncio.sleep(0.5)
-    
+
     # Test 4: Multiple datagrams
     logger.info("\nTest 4: Sending multiple datagrams...")
     for i in range(3):
-        client.send_datagram(f"Datagram #{i+1}".encode())
+        client.send_datagram(f"Datagram #{i + 1}".encode())
         await asyncio.sleep(0.2)
-    
+
     await asyncio.sleep(1.0)
-    logger.info("\n" + "="*60)
+    logger.info("\n" + "=" * 60)
     logger.info("Demo complete!")
-    logger.info("="*60)
+    logger.info("=" * 60)
 
 
 async def main():
     # Get mkcert CA root path
     import os
+
     # Use system CA bundle (includes mkcert CA after mkcert -install)
     system_ca = "/etc/ssl/certs/ca-certificates.crt"
-    
+
     parser = argparse.ArgumentParser(description="WebTransport Echo Client")
     parser.add_argument("--host", default="127.0.0.1", help="Server hostname")
     parser.add_argument("--port", type=int, default=6161, help="Server port")
     parser.add_argument("--path", default="/echo", help="WebTransport endpoint path")
-    parser.add_argument("--ca-cert", default=system_ca,
-                       help="CA certificate for TLS verification (default: system CA bundle)")
-    parser.add_argument("--insecure", action="store_true", default=False,
-                       help="Skip certificate verification (for self-signed certs)")
-    parser.add_argument("--interactive", "-i", action="store_true",
-                       help="Run in interactive mode")
+    parser.add_argument(
+        "--ca-cert",
+        default=system_ca,
+        help="CA certificate for TLS verification (default: system CA bundle)",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        default=False,
+        help="Skip certificate verification (for self-signed certs)",
+    )
+    parser.add_argument(
+        "--interactive", "-i", action="store_true", help="Run in interactive mode"
+    )
     args = parser.parse_args()
 
     config = QuicConfiguration(
@@ -139,7 +165,7 @@ async def main():
         alpn_protocols=H3_ALPN,
         max_datagram_frame_size=65536,
     )
-    
+
     if args.insecure:
         config.verify_mode = False
         logger.warning("Certificate verification disabled (insecure mode)")
@@ -147,10 +173,12 @@ async def main():
         config.load_verify_locations(args.ca_cert)
         logger.info("Loaded CA certificate from: %s", args.ca_cert)
     else:
-        logger.warning("CA certificate not found at %s, connection may fail", args.ca_cert)
+        logger.warning(
+            "CA certificate not found at %s, connection may fail", args.ca_cert
+        )
 
     authority = f"{args.host}:{args.port}"
-    
+
     logger.info("Connecting to https://%s%s", authority, args.path)
 
     async with connect(
@@ -160,12 +188,12 @@ async def main():
         create_protocol=WebTransportClient,
     ) as client:
         await client.establish_session(authority, args.path)
-        
+
         if args.interactive:
             await interactive_mode(client)
         else:
             await demo_mode(client)
-        
+
         await asyncio.sleep(0.5)
 
 
