@@ -31,18 +31,20 @@ class ServerLogMonitor(BaseMonitor):
         self._db = log_db
         self._current_test_index = 0
         self._delay_secs = delay_ms / 1000.0
+        self._max_processed_conn_idx = -1
+        self._accumulated_lines = []
 
     def post_start_target(self, target, fuzz_data_logger, session, *args, **kwargs):
-        """Called after target connection is opened. Drain any startup noise."""
-        self._server.drain_lines()
+        """Called after target connection is opened. Accumulate any startup logs."""
+        self._accumulated_lines.extend(self._server.drain_lines())
 
     def pre_send(self, target, fuzz_data_logger, session, *args, **kwargs):
         """Track the current test case index before sending."""
         self._current_test_index = (
             session.mutant_index if hasattr(session, "mutant_index") else 0
         )
-        # Drain any lines from between test cases (e.g. from health checks)
-        self._server.drain_lines()
+        # Accumulate any logs from just before sending
+        self._accumulated_lines.extend(self._server.drain_lines())
 
     def post_send(
         self, target, fuzz_data_logger, session, mutated_data=None, *args, **kwargs
@@ -62,30 +64,71 @@ class ServerLogMonitor(BaseMonitor):
             except Exception:
                 pass
 
+        # FORCE CLOSE the fuzzer connection before we sleep and drain logs.
+        # This guarantees the server will emit the SESSION_CLOSE log for the
+        # fuzzed request (which otherwise wouldn't happen until boofuzz closes
+        # it *after* post_send finishes). Boofuzz's subsequent target.close()
+        # safely ignores already-closed connections.
+        try:
+            if target._target_connection:
+                target._target_connection.close()
+        except Exception:
+            pass
+
         # Give the server a moment to process the payload and log panics
         time.sleep(self._delay_secs)
 
-        # Drain all server output since the last drain
-        lines = self._server.drain_lines()
+        # Drain all server output since the last drain, combining with accumulated
+        lines = self._accumulated_lines + self._server.drain_lines()
+        self._accumulated_lines = []
 
-        # Filter out stray WTFUZZ lines from previous testcases (like health checks or slow closes).
-        # We find the LAST SESSION_OPEN, and drop any WTFUZZ line before it, but we KEEP panics.
-        last_open_idx = -1
-        for i, line in enumerate(lines):
-            if line.startswith(f"{WTFUZZ_PREFIX}SESSION_OPEN"):
-                last_open_idx = i
+        # Filter out stray WTFUZZ lines from previous testcases
+        # Group lines by their conn_idx, dropping those from old connection cycles,
+        # and strip the conn_idx field before recording.
+        conn_lines = {}
+        raw_lines = []
+        current_max_idx = self._max_processed_conn_idx
 
-        if last_open_idx != -1:
-            filtered_lines = []
-            for i, line in enumerate(lines):
-                if i < last_open_idx:
-                    # Keep raw panics/errors from previous late-terminating testcases,
-                    # but drop the stray WTFUZZ structured lines (e.g. SESSION_CLOSE).
-                    if not line.startswith(WTFUZZ_PREFIX):
-                        filtered_lines.append(line)
+        for line in lines:
+            if line.startswith(WTFUZZ_PREFIX):
+                parts = line.split("|")
+                if len(parts) >= 3:
+                    try:
+                        idx = int(parts[1])
+                        # Accept if it's a new connection index
+                        if idx > self._max_processed_conn_idx:
+                            if idx not in conn_lines:
+                                conn_lines[idx] = []
+                            # Strip the connection index: WTFUZZ|<conn_idx>|EVENT|... -> WTFUZZ|EVENT|...
+                            stripped_line = f"{WTFUZZ_PREFIX}{'|'.join(parts[2:])}"
+                            conn_lines[idx].append(stripped_line)
+
+                            if idx > current_max_idx:
+                                current_max_idx = idx
+                        else:
+                            # It's an old connection's delayed log, ignore it completely.
+                            pass
+                    except ValueError:
+                        # Couldn't parse idx, treat as raw
+                        raw_lines.append(line)
                 else:
-                    filtered_lines.append(line)
-            lines = filtered_lines
+                    # Malformed WTFUZZ line
+                    raw_lines.append(line)
+            else:
+                # Raw panic/error line - always keep
+                raw_lines.append(line)
+
+        self._max_processed_conn_idx = current_max_idx
+
+        filtered_lines = []
+        # Group perfectly by connection ID
+        for idx in sorted(conn_lines.keys()):
+            filtered_lines.extend(conn_lines[idx])
+
+        # Append any raw lines
+        filtered_lines.extend(raw_lines)
+
+        lines = filtered_lines
 
         # Store in DB (log_group deduplication handled internally)
         self._db.record_test_case(

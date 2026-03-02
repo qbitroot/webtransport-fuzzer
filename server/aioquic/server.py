@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # WTFUZZ structured logging
 # ---------------------------------------------------------------------------
-# Format: WTFUZZ|EVENT|key=val|key=val
+# Format: WTFUZZ|<conn_idx>|EVENT|key=val|key=val
 #
 # Generic events (language-agnostic, derived from the WT spec):
 #   SESSION_OPEN      - WebTransport session established
@@ -65,12 +65,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def wtfuzz(event: str, **kv):
+def wtfuzz(conn_idx: int, event: str, **kv):
     """Print a WTFUZZ structured log line to stdout (flushed immediately)."""
-    parts = [f"WTFUZZ|{event}"]
+    parts = [f"WTFUZZ|{conn_idx}|{event}"]
     for k, v in kv.items():
         parts.append(f"{k}={v}")
     print("|".join(parts), flush=True)
+
+
+# Global connection counter for aioquic
+_connection_counter = 0
 
 
 class EchoHandler:
@@ -81,24 +85,25 @@ class EchoHandler:
     - Datagrams: echo back immediately.
     """
 
-    def __init__(self, session_id, http: H3Connection) -> None:
+    def __init__(self, conn_idx, session_id, http: H3Connection) -> None:
+        self._conn_idx = conn_idx
         self._session_id = session_id
         self._http = http
         self._payloads = defaultdict(bytearray)
 
     def h3_event_received(self, event: H3Event) -> None:
         if isinstance(event, DatagramReceived):
-            wtfuzz("RECV_DATAGRAM", session_id=self._session_id)
+            wtfuzz(self._conn_idx, "RECV_DATAGRAM", session_id=self._session_id)
             self._http.send_datagram(self._session_id, event.data)
-            wtfuzz("ECHO", type="datagram", session_id=self._session_id)
+            wtfuzz(self._conn_idx, "ECHO", type="datagram", session_id=self._session_id)
 
         if isinstance(event, WebTransportStreamDataReceived):
             self._payloads[event.stream_id] += event.data
 
             if stream_is_unidirectional(event.stream_id):
-                wtfuzz("RECV_UNI", stream_id=event.stream_id)
+                wtfuzz(self._conn_idx, "RECV_UNI", stream_id=event.stream_id)
             else:
-                wtfuzz("RECV_BIDI", stream_id=event.stream_id)
+                wtfuzz(self._conn_idx, "RECV_BIDI", stream_id=event.stream_id)
 
             if event.stream_ended:
                 if stream_is_unidirectional(event.stream_id):
@@ -112,7 +117,7 @@ class EchoHandler:
                 stream_type = (
                     "uni" if stream_is_unidirectional(event.stream_id) else "bidi"
                 )
-                wtfuzz("ECHO", type=stream_type, stream_id=response_id)
+                wtfuzz(self._conn_idx, "ECHO", type=stream_type, stream_id=response_id)
                 self.stream_closed(event.stream_id)
 
     def stream_closed(self, stream_id: int) -> None:
@@ -133,12 +138,19 @@ class WebTransportProtocol(QuicConnectionProtocol):
             self._http = H3Connection(self._quic, enable_webtransport=True)
         elif isinstance(event, StreamReset) and self._handler is not None:
             wtfuzz(
-                "STREAM_RESET", stream_id=event.stream_id, error_code=event.error_code
+                self._handler._conn_idx,
+                "STREAM_RESET",
+                stream_id=event.stream_id,
+                error_code=event.error_code,
             )
             self._handler.stream_closed(event.stream_id)
         elif isinstance(event, ConnectionTerminated):
             if self._handler:
-                wtfuzz("SESSION_CLOSE", session_id=self._handler._session_id)
+                wtfuzz(
+                    self._handler._conn_idx,
+                    "SESSION_CLOSE",
+                    session_id=self._handler._session_id,
+                )
                 self._handler = None
 
         if self._http is not None:
@@ -171,9 +183,12 @@ class WebTransportProtocol(QuicConnectionProtocol):
             return
         if path == b"/echo":
             assert self._handler is None
-            self._handler = EchoHandler(stream_id, self._http)
+            global _connection_counter
+            current_conn_idx = _connection_counter
+            _connection_counter += 1
+            self._handler = EchoHandler(current_conn_idx, stream_id, self._http)
             self._send_response(stream_id, 200)
-            wtfuzz("SESSION_OPEN", session_id=stream_id)
+            wtfuzz(current_conn_idx, "SESSION_OPEN", session_id=stream_id)
         else:
             self._send_response(stream_id, 404, end_stream=True)
 
@@ -215,7 +230,7 @@ if __name__ == "__main__":
         )
     )
     try:
-        wtfuzz("SERVER_READY", bind=f"{BIND_ADDRESS}:{BIND_PORT}")
+        wtfuzz(0, "SERVER_READY", bind=f"{BIND_ADDRESS}:{BIND_PORT}")
         loop.run_forever()
     except KeyboardInterrupt:
         pass

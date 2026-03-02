@@ -22,10 +22,11 @@ The fuzzer uses a two-layer logging system: **structured WTFUZZ lines** emitted 
 All instrumented servers must emit structured log lines to **stdout** in this pipe-delimited format:
 
 ```
-WTFUZZ|EVENT|key1=val1|key2=val2|...
+WTFUZZ|<conn_idx>|EVENT|key1=val1|key2=val2|...
 ```
 
 - **Prefix**: Every structured line starts with `WTFUZZ|` (defined as `WTFUZZ_PREFIX` in `src/log_db.py:26`).
+- **conn_idx**: A zero-indexed connection counter maintained by the server. It increments for every new incoming connection/session.
 - **EVENT**: A short, uppercase event name (see table below).
 - **Key-value pairs**: Zero or more `key=value` segments, separated by `|`.
 - **Flush**: Lines must be flushed immediately (`flush=True`) so the monitor can read them without delay.
@@ -84,9 +85,10 @@ test_cases
 
 To instrument a new server for this fuzzer:
 
-1. Print `WTFUZZ|EVENT|key=val|...` lines to **stdout**, flushed immediately.
-2. Send all other logging to **stderr**.
-3. Use the event names from the catalog above for consistency across implementations.
+1. Maintain a global connection counter (starting at 0).
+2. Print `WTFUZZ|<conn_idx>|EVENT|key=val|...` lines to **stdout**, flushed immediately.
+3. Send all other logging to **stderr**.
+4. Use the event names from the catalog above for consistency across implementations.
 
 ---
 

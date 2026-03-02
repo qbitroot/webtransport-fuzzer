@@ -14,7 +14,7 @@ use wtransport::ServerConfig;
 // ---------------------------------------------------------------------------
 // WTFUZZ structured logging
 // ---------------------------------------------------------------------------
-// Format: WTFUZZ|EVENT|key=val|key=val
+// Format: WTFUZZ|<conn_idx>|EVENT|key=val|key=val
 //
 // All structured lines go to stdout and are flushed immediately.
 // All other diagnostic output (tracing) goes to stderr.
@@ -31,8 +31,8 @@ use wtransport::ServerConfig;
 // ---------------------------------------------------------------------------
 
 macro_rules! wtfuzz {
-    ($event:expr $(, $key:ident = $val:expr)*) => {{
-        let mut line = format!("WTFUZZ|{}", $event);
+    ($conn_idx:expr, $event:expr $(, $key:ident = $val:expr)*) => {{
+        let mut line = format!("WTFUZZ|{}|{}", $conn_idx, $event);
         $(
             line.push('|');
             line.push_str(&format!("{}={}", stringify!($key), $val));
@@ -42,7 +42,7 @@ macro_rules! wtfuzz {
     }};
 }
 
-const BIND_PORT: u16 = 4433;
+const BIND_PORT: u16 = 6161;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,24 +57,24 @@ async fn main() -> Result<()> {
     let server = Endpoint::server(config)?;
 
     info!("Server ready!");
-    wtfuzz!("SERVER_READY", bind = format!("0.0.0.0:{}", BIND_PORT));
+    wtfuzz!(0, "SERVER_READY", bind = format!("0.0.0.0:{}", BIND_PORT));
 
     for id in 0.. {
         let incoming_session = server.accept().await;
         tokio::spawn(
-            handle_connection(incoming_session).instrument(info_span!("Connection", id))
+            handle_connection(id, incoming_session).instrument(info_span!("Connection", id))
         );
     }
 
     Ok(())
 }
 
-async fn handle_connection(incoming_session: IncomingSession) {
-    let result = handle_connection_impl(incoming_session).await;
+async fn handle_connection(conn_idx: u64, incoming_session: IncomingSession) {
+    let result = handle_connection_impl(conn_idx, incoming_session).await;
     error!("{:?}", result);
 }
 
-async fn handle_connection_impl(incoming_session: IncomingSession) -> Result<()> {
+async fn handle_connection_impl(conn_idx: u64, incoming_session: IncomingSession) -> Result<()> {
     let mut buffer = vec![0; 65536].into_boxed_slice();
 
     info!("Waiting for session request...");
@@ -93,18 +93,19 @@ async fn handle_connection_impl(incoming_session: IncomingSession) -> Result<()>
     // so it matches across test runs (unlike pointers or process-lifetime counters).
     let session_id = connection.session_id().into_u64();
 
-    wtfuzz!("SESSION_OPEN", session_id = session_id);
+    wtfuzz!(conn_idx, "SESSION_OPEN", session_id = session_id);
 
     info!("Waiting for data from client...");
 
-    let result = run_session(&connection, &mut buffer, session_id).await;
+    let result = run_session(conn_idx, &connection, &mut buffer, session_id).await;
 
-    wtfuzz!("SESSION_CLOSE", session_id = session_id);
+    wtfuzz!(conn_idx, "SESSION_CLOSE", session_id = session_id);
 
     result
 }
 
 async fn run_session(
+    conn_idx: u64,
     connection: &wtransport::Connection,
     buffer: &mut Box<[u8]>,
     session_id: u64,
@@ -116,7 +117,7 @@ async fn run_session(
                 info!("Accepted BI stream");
 
                 let stream_id = stream.1.id().into_u64();
-                wtfuzz!("RECV_BIDI", stream_id = stream_id);
+                wtfuzz!(conn_idx, "RECV_BIDI", stream_id = stream_id);
 
                 let Some(bytes_read) = stream.1.read(buffer).await? else {
                     continue;
@@ -126,14 +127,14 @@ async fn run_session(
                 info!("Received (bi) '{str_data}' from client");
 
                 stream.0.write_all(b"ACK").await?;
-                wtfuzz!("ECHO", type = "bidi", stream_id = stream_id);
+                wtfuzz!(conn_idx, "ECHO", type = "bidi", stream_id = stream_id);
             }
             stream = connection.accept_uni() => {
                 let mut stream = stream?;
                 info!("Accepted UNI stream");
 
                 let stream_id = stream.id().into_u64();
-                wtfuzz!("RECV_UNI", stream_id = stream_id);
+                wtfuzz!(conn_idx, "RECV_UNI", stream_id = stream_id);
 
                 let Some(bytes_read) = stream.read(buffer).await? else {
                     continue;
@@ -144,16 +145,16 @@ async fn run_session(
 
                 let mut send_stream = connection.open_uni().await?.await?;
                 send_stream.write_all(b"ACK").await?;
-                wtfuzz!("ECHO", type = "uni", stream_id = stream_id);
+                wtfuzz!(conn_idx, "ECHO", type = "uni", stream_id = stream_id);
             }
             dgram = connection.receive_datagram() => {
                 let dgram = dgram?;
                 let str_data = std::str::from_utf8(&dgram)?;
                 info!("Received (dgram) '{str_data}' from client");
 
-                wtfuzz!("RECV_DATAGRAM", session_id = session_id);
+                wtfuzz!(conn_idx, "RECV_DATAGRAM", session_id = session_id);
                 connection.send_datagram(b"ACK")?;
-                wtfuzz!("ECHO", type = "datagram", session_id = session_id);
+                wtfuzz!(conn_idx, "ECHO", type = "datagram", session_id = session_id);
             }
         }
     }
