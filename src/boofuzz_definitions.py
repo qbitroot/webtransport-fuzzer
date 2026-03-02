@@ -12,36 +12,32 @@ from boofuzz import (
 # https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-14
 # =============================================================================
 
-# Stream Type Constants (VarInt encoded)
-WT_STREAM_TYPE_UNI = b"\x40\x54"  # 0x54 = 84, unidirectional WebTransport stream
-WT_STREAM_TYPE_BIDI = b"\x41"  # 0x41 = 65, server-initiated bidi header
+# Stream Type / Signal Constants (VarInt encoded)
+WT_STREAM_TYPE_UNI = b"\x40\x54"  # 0x54 = 84, unidirectional WebTransport stream type
+WT_STREAM_TYPE_BIDI = b"\x40\x41"  # 0x41 = 65, bidirectional WT_STREAM signal value
 
 # Capsule Type Constants (VarInt encoded per RFC 9000 §16)
 # 0x2843 = 10307 -> 2-byte VarInt: (0x40 | (10307 >> 8)), (10307 & 0xFF) = 0x68, 0x43
 CAPSULE_CLOSE_SESSION = b"\x68\x43"  # WT_CLOSE_SESSION (0x2843)
 
-# 0x78AE = 30894 -> 4-byte VarInt: 0x80 prefix for values >= 16384
+# 0x78AE = 30894 -> 4-byte VarInt: (0x80 | (30894 >> 24)), ...
 CAPSULE_DRAIN_SESSION = b"\x80\x00\x78\xae"  # WT_DRAIN_SESSION (0x78AE)
 
-# Flow Control Capsules (4-byte VarInt, 0x190B4D** values)
-CAPSULE_MAX_DATA = b"\x80\x19\x0b\x4d\x3d"  # WT_MAX_DATA (0x190B4D3D)
-CAPSULE_MAX_STREAM_DATA = b"\x80\x19\x0b\x4d\x3e"  # WT_MAX_STREAM_DATA (0x190B4D3E)
-CAPSULE_MAX_STREAMS_BIDI = b"\x80\x19\x0b\x4d\x3f"  # WT_MAX_STREAMS bidi (0x190B4D3F)
-CAPSULE_MAX_STREAMS_UNI = b"\x80\x19\x0b\x4d\x40"  # WT_MAX_STREAMS uni (0x190B4D40)
-CAPSULE_DATA_BLOCKED = b"\x80\x19\x0b\x4d\x41"  # WT_DATA_BLOCKED (0x190B4D41)
-CAPSULE_STREAM_DATA_BLOCKED = (
-    b"\x80\x19\x0b\x4d\x42"  # WT_STREAM_DATA_BLOCKED (0x190B4D42)
-)
+# Flow Control Capsules (correct 4-byte VarInt encoding, 0x190B4D** values)
+# 0x190B4D3D -> first byte: (0x19 | 0x80) = 0x99
+CAPSULE_MAX_DATA = b"\x99\x0b\x4d\x3d"  # WT_MAX_DATA (0x190B4D3D)
+CAPSULE_MAX_STREAMS_BIDI = b"\x99\x0b\x4d\x3f"  # WT_MAX_STREAMS bidi (0x190B4D3F)
+CAPSULE_MAX_STREAMS_UNI = b"\x99\x0b\x4d\x40"  # WT_MAX_STREAMS uni (0x190B4D40)
+CAPSULE_DATA_BLOCKED = b"\x99\x0b\x4d\x41"  # WT_DATA_BLOCKED (0x190B4D41)
 CAPSULE_STREAMS_BLOCKED_BIDI = (
-    b"\x80\x19\x0b\x4d\x43"  # WT_STREAMS_BLOCKED bidi (0x190B4D43)
+    b"\x99\x0b\x4d\x43"  # WT_STREAMS_BLOCKED bidi (0x190B4D43)
 )
-CAPSULE_STREAMS_BLOCKED_UNI = (
-    b"\x80\x19\x0b\x4d\x44"  # WT_STREAMS_BLOCKED uni (0x190B4D44)
-)
+CAPSULE_STREAMS_BLOCKED_UNI = b"\x99\x0b\x4d\x44"  # WT_STREAMS_BLOCKED uni (0x190B4D44)
 
-# Stream Control Capsules
-CAPSULE_RESET_STREAM = b"\x80\x19\x0b\x4d\x39"  # WT_RESET_STREAM (0x190B4D39)
-CAPSULE_STOP_SENDING = b"\x80\x19\x0b\x4d\x3a"  # WT_STOP_SENDING (0x190B4D3A)
+# Note: WT_MAX_STREAM_DATA (0x190B4D3E) and WT_STREAM_DATA_BLOCKED (0x190B4D42) are
+# explicitly PROHIBITED in draft-ietf-webtrans-http3-14 §5.4: per-stream flow control
+# is handled by QUIC natively; receipt MUST be treated as a session error.
+# WT_RESET_STREAM and WT_STOP_SENDING are QUIC-level frames, not WebTransport capsules.
 
 import struct
 
@@ -70,21 +66,17 @@ def encode_quic_varint(value):
 # Value Collections for Fuzzing
 # =============================================================================
 
-# 1. Valid Canonical Capsule Types
+# 1. Valid Canonical Capsule Types (only those defined in draft-ietf-webtrans-http3-14)
 VALID_CAPSULE_TYPES = [
     CAPSULE_CLOSE_SESSION,  # WT_CLOSE_SESSION (0x2843)
     CAPSULE_DRAIN_SESSION,  # WT_DRAIN_SESSION (0x78AE)
-    CAPSULE_RESET_STREAM,  # WT_RESET_STREAM
-    CAPSULE_STOP_SENDING,  # WT_STOP_SENDING
-    CAPSULE_MAX_DATA,  # WT_MAX_DATA
-    CAPSULE_MAX_STREAM_DATA,  # WT_MAX_STREAM_DATA
-    CAPSULE_MAX_STREAMS_BIDI,  # WT_MAX_STREAMS bidi
-    CAPSULE_MAX_STREAMS_UNI,  # WT_MAX_STREAMS uni
-    CAPSULE_DATA_BLOCKED,  # WT_DATA_BLOCKED
-    CAPSULE_STREAM_DATA_BLOCKED,  # WT_STREAM_DATA_BLOCKED
-    CAPSULE_STREAMS_BLOCKED_BIDI,  # WT_STREAMS_BLOCKED bidi
-    CAPSULE_STREAMS_BLOCKED_UNI,  # WT_STREAMS_BLOCKED uni
-    b"\x00",  # Type 0 (unknown)
+    CAPSULE_MAX_DATA,  # WT_MAX_DATA (0x190B4D3D)
+    CAPSULE_MAX_STREAMS_BIDI,  # WT_MAX_STREAMS bidi (0x190B4D3F)
+    CAPSULE_MAX_STREAMS_UNI,  # WT_MAX_STREAMS uni (0x190B4D40)
+    CAPSULE_DATA_BLOCKED,  # WT_DATA_BLOCKED (0x190B4D41)
+    CAPSULE_STREAMS_BLOCKED_BIDI,  # WT_STREAMS_BLOCKED bidi (0x190B4D43)
+    CAPSULE_STREAMS_BLOCKED_UNI,  # WT_STREAMS_BLOCKED uni (0x190B4D44)
+    b"\x00",  # Type 0 (unknown, must be ignored per RFC 9297)
 ]
 
 # 2. Interesting Numeric Boundaries (QUIC VarInt Encoded)
@@ -121,25 +113,89 @@ VALID_VARINT_ENC = [encode_quic_varint(v) for v in INTERESTING_NUMBERS]
 
 # 3. Malformed / Edge Case Byte Sequences
 MALFORMED_VARINTS = [
-    b"\x80\x00\x28\x43",  # CLOSE type as overlong 4-byte VarInt
-    b"\xc0\x00\x00\x00\x00\x00\x28\x43",  # CLOSE type as overlong 8-byte VarInt
-    b"\xc0\x00\x00\x00\x00\x00\x78\xae",  # DRAIN type as overlong 8-byte VarInt
-    b"\x78\xae",  # DRAIN raw bytes (invalid VarInt, misses 0x80 prefix)
-    b"\x28\x43",  # CLOSE raw bytes (invalid VarInt, misses 0x40 prefix)
+    # Overlong encodings of valid capsule types (valid value, non-canonical encoding)
+    b"\x80\x00\x28\x43",  # CLOSE (0x2843) as overlong 4-byte VarInt
+    b"\xc0\x00\x00\x00\x00\x00\x28\x43",  # CLOSE (0x2843) as overlong 8-byte VarInt
+    b"\xc0\x00\x00\x00\x00\x00\x78\xae",  # DRAIN (0x78AE) as overlong 8-byte VarInt
+    b"\xc0\x00\x00\x00\x19\x0b\x4d\x3d",  # WT_MAX_DATA (0x190B4D3D) as 8-byte VarInt
+    b"\xc0\x00\x00\x00\x19\x0b\x4d\x3f",  # WT_MAX_STREAMS bidi as 8-byte VarInt
+    # Raw bytes without correct VarInt prefix (would be misread as different values)
+    b"\x78\xae",  # DRAIN raw bytes (parsed as 2-byte VarInt for 0x38AE, not 0x78AE)
+    b"\x28\x43",  # CLOSE raw bytes (parsed as 1-byte 0x28 + extra, not 0x2843)
+    # Boundary / truncation cases
     b"\x3f",  # Max 1-byte VarInt (63)
-    b"\x7f\xff",  # Max 2-byte VarInt (16383)
-    b"\xff",  # Invalid prefix (11 indicates 8-byte length, but only 1 byte provided)
-    b"\x80\x00",  # truncated 4-byte VarInt
-    b"\xc0\x00\x00\x00",  # truncated 8-byte VarInt
-    b"\xc0\x00\x00\x00\x00\x00\x00\x00",  # Technically valid 8-byte encoded zero
-    b"\xff\xff\xff\xff\xff\xff\xff\xff",  # 8 bytes of 0xFF (Acts as an invalid oversized/negative encoding)
-    b"",  # Empty byte string to test completely omitted fields
+    b"\x7f\xff",  # Invalid: top bits 01 but MSB of second byte set (not a standard VarInt)
+    b"\xff",  # Invalid: 8-byte prefix (0xC0) but only 1 byte provided
+    b"\x80\x00",  # Truncated 4-byte VarInt (only 2 of 4 bytes)
+    b"\xc0\x00\x00\x00",  # Truncated 8-byte VarInt (only 4 of 8 bytes)
+    b"\xc0\x00\x00\x00\x00\x00\x00\x00",  # Valid 8-byte encoding of zero
+    b"\xff\xff\xff\xff\xff\xff\xff\xff",  # 8 bytes of 0xFF (value exceeds 2^62-1, invalid)
+    b"",  # Completely omitted field
+]
+
+# 4. QUIC and HTTP/3 Frame Types encoded as VarInts
+# These are NOT WebTransport capsule types. Injecting them as a capsule type
+# tests that the target treats the stream as capsule data and does NOT dispatch
+# them as QUIC or HTTP/3 control frames (layer confusion / type confusion attack).
+INCORRECT_QUIC_FRAMES = [
+    # QUIC frame types (RFC 9000 §19) — all single-byte VarInts
+    b"\x00",  # PADDING
+    b"\x01",  # PING
+    b"\x02",  # ACK (no ECN)
+    b"\x03",  # ACK (with ECN)
+    b"\x04",  # RESET_STREAM
+    b"\x05",  # STOP_SENDING
+    b"\x06",  # CRYPTO
+    b"\x07",  # NEW_TOKEN
+    b"\x08",  # STREAM (base type; 0x08-0x0f are STREAM variants)
+    b"\x0f",  # STREAM (all flags set)
+    b"\x10",  # MAX_DATA
+    b"\x11",  # MAX_STREAM_DATA
+    b"\x12",  # MAX_STREAMS (bidi)
+    b"\x13",  # MAX_STREAMS (uni)
+    b"\x14",  # DATA_BLOCKED
+    b"\x15",  # STREAM_DATA_BLOCKED
+    b"\x16",  # STREAMS_BLOCKED (bidi)
+    b"\x17",  # STREAMS_BLOCKED (uni)
+    b"\x18",  # NEW_CONNECTION_ID
+    b"\x19",  # RETIRE_CONNECTION_ID
+    b"\x1a",  # PATH_CHALLENGE
+    b"\x1b",  # PATH_RESPONSE
+    b"\x1c",  # CONNECTION_CLOSE (QUIC error)
+    b"\x1d",  # CONNECTION_CLOSE (app error)
+    b"\x1e",  # HANDSHAKE_DONE
+    # HTTP/3 frame types (RFC 9114 §7.2)
+    # 0x00 and 0x01 overlap with QUIC above; add the distinct ones
+    b"\x03",  # CANCEL_PUSH
+    b"\x04",  # SETTINGS
+    b"\x05",  # PUSH_PROMISE
+    b"\x07",  # GOAWAY
+    b"\x0d",  # MAX_PUSH_ID
+    b"\x0c",  # ORIGIN (RFC 9412)
+    b"\x40\x4d",  # METADATA (0x4d, provisional)
+    b"\x80\x0f\x07\x00",  # PRIORITY_UPDATE (0xf0700, RFC 9218)
+    # HTTP/3 reserved "grease" frame types: 0x1f*N+0x21 for N=0,1,...
+    # These must be ignored by implementations; using them as capsule type
+    # should also be gracefully ignored, not crash.
+    b"\x21",  # N=0: 0x21
+    b"\x40\x40",  # N=1: 0x40
+    b"\x40\x5f",  # N=2: 0x5f
+    b"\x40\x7e",  # N=3: 0x7e
+    b"\x40\x9d",  # N=4: 0x9d
+    b"\x40\xbc",  # N=5: 0xbc
+    b"\x40\xdb",  # N=6: 0xdb
+    b"\x40\xfa",  # N=7: 0xfa
 ]
 
 # Merge everything to ensure crossover fuzzing.
 # By feeding capsule types into length, and lengths into type, we test unexpected state transitions.
 ALL_INTERESTING_BYTES = list(
-    dict.fromkeys(VALID_CAPSULE_TYPES + VALID_VARINT_ENC + MALFORMED_VARINTS)
+    dict.fromkeys(
+        VALID_CAPSULE_TYPES
+        + VALID_VARINT_ENC
+        + MALFORMED_VARINTS
+        + INCORRECT_QUIC_FRAMES
+    )
 )
 
 # =============================================================================

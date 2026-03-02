@@ -35,16 +35,16 @@ Standard Python logging (warnings, debug, etc.) goes to **stderr** and is not ca
 
 #### Event Catalog
 
-| Event            | Key-value pairs                  | Description                              |
-|------------------|----------------------------------|------------------------------------------|
-| `SERVER_READY`   | `bind=<host>:<port>`             | Server is listening and ready             |
-| `SESSION_OPEN`   | `session_id=<id>`                | WebTransport session established          |
-| `SESSION_CLOSE`  | `session_id=<id>`                | WebTransport session terminated           |
-| `RECV_BIDI`      | `stream_id=<id>`                 | Data received on a bidirectional stream   |
-| `RECV_UNI`       | `stream_id=<id>`                 | Data received on a unidirectional stream  |
-| `RECV_DATAGRAM`  | `session_id=<id>`                | Datagram received                         |
-| `ECHO`           | `type=<bidi\|uni\|datagram>`, `session_id=<id>` or `stream_id=<id>` | Echo response sent |
-| `STREAM_RESET`   | `stream_id=<id>`, `error_code=<code>` | Stream reset received                |
+| Event           | Key-value pairs                                                     | Description                              |
+| --------------- | ------------------------------------------------------------------- | ---------------------------------------- |
+| `SERVER_READY`  | `bind=<host>:<port>`                                                | Server is listening and ready            |
+| `SESSION_OPEN`  | `session_id=<id>`                                                   | WebTransport session established         |
+| `SESSION_CLOSE` | `session_id=<id>`                                                   | WebTransport session terminated          |
+| `RECV_BIDI`     | `stream_id=<id>`                                                    | Data received on a bidirectional stream  |
+| `RECV_UNI`      | `stream_id=<id>`                                                    | Data received on a unidirectional stream |
+| `RECV_DATAGRAM` | `session_id=<id>`                                                   | Datagram received                        |
+| `ECHO`          | `type=<bidi\|uni\|datagram>`, `session_id=<id>` or `stream_id=<id>` | Echo response sent                       |
+| `STREAM_RESET`  | `stream_id=<id>`, `error_code=<code>`                               | Stream reset received                    |
 
 These events are language-agnostic and derived from the WebTransport spec, so any server implementation (not just the Python echo server) can emit them.
 
@@ -52,7 +52,7 @@ These events are language-agnostic and derived from the WebTransport spec, so an
 
 `LogDB` (`src/log_db.py`) stores all captured output in a normalized SQLite database with WAL mode enabled.
 
-Server output is **stored verbatim** — no parsing or validation is performed. Because the WTFUZZ format is already structured and self-describing, the raw lines *are* the structured data. This also means that if the server emits unexpected output (panics, stack traces, assertion failures), it is captured alongside the structured lines, making anomalies immediately visible by their deviation from the normal pattern.
+Server output is **stored verbatim** — no parsing or validation is performed. Because the WTFUZZ format is already structured and self-describing, the raw lines _are_ the structured data. This also means that if the server emits unexpected output (panics, stack traces, assertion failures), it is captured alongside the structured lines, making anomalies immediately visible by their deviation from the normal pattern.
 
 #### Schema
 
@@ -78,7 +78,7 @@ test_cases
 
 1. **`pre_send`** — Drains any buffered server output between test cases (e.g. health-check noise).
 2. **`post_send`** — Drains all server output since last drain, calls `LogDB.record_test_case()` to store it, and logs a summary (`N structured + M raw lines`) to boofuzz's logger.
-3. **Raw line flagging** — Any line that does *not* start with `WTFUZZ|` is logged prominently as `[SERVER RAW]` since these typically indicate panics, exceptions, or unexpected output.
+3. **Raw line flagging** — Any line that does _not_ start with `WTFUZZ|` is logged prominently as `[SERVER RAW]` since these typically indicate panics, exceptions, or unexpected output.
 4. **Liveness check** — Returns `False` (triggering boofuzz failure) if the server process has died.
 
 ### Adding a New Server Implementation
@@ -89,6 +89,10 @@ To instrument a new server for this fuzzer:
 2. Print `WTFUZZ|<conn_idx>|EVENT|key=val|...` lines to **stdout**, flushed immediately.
 3. Send all other logging to **stderr**.
 4. Use the event names from the catalog above for consistency across implementations.
+
+### Environment
+
+Use `uv run` as a venv.
 
 ---
 
