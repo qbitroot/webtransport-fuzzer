@@ -9,16 +9,22 @@ same output all point to the same log_group_id, making it trivial to
 group by failure mode.
 
 No parsing or validation is performed on the server output. The WTFUZZ
-structured log format (``WTFUZZ|EVENT|k=v|...``) is already self-describing,
-so lines are stored verbatim. If the server emits unexpected output (panics,
-exceptions, etc.), it is captured alongside the structured lines, making
-anomalies immediately visible by their deviation from the expected pattern.
+structured log format (``WTFUZZ|<conn_idx>|EVENT|k=v|...``) is already
+self-describing, so lines are stored verbatim. If the server emits
+unexpected output (panics, exceptions, etc.), it is captured alongside the
+structured lines, making anomalies immediately visible by their deviation
+from the expected pattern.
+
+sent_data is stored as newline-separated hex strings, one per write:
+    "4041ff\n6843"
+means two writes were sent in sequence within the same session.
 """
 
 import hashlib
 import logging
 import sqlite3
 import time
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +40,12 @@ class LogDB:
         log_groups   — unique server output patterns (deduplicated)
         test_cases   — each fuzzer request, pointing to a log_group
 
+    sent_data is stored as newline-separated hex strings (one per write).
+    Use encode_sent() / decode_sent() to convert to/from raw bytes.
+
     Usage:
         db = LogDB("fuzzer_logs.db")
-        db.record_test_case(index=42, sent_data=b"\\x00\\x01", lines=[...])
+        db.record_test_case(index=42, sent_writes=[b"\\x00\\x01"], is_healthcheck=False)
         db.close()
     """
 
@@ -56,11 +65,12 @@ class LogDB:
             );
 
             CREATE TABLE IF NOT EXISTS test_cases (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                test_index   INTEGER NOT NULL,
-                sent_data    BLOB,
-                log_group_id INTEGER REFERENCES log_groups(id),
-                timestamp    REAL NOT NULL
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                test_index      INTEGER,
+                sent_data       TEXT,
+                is_healthcheck  INTEGER NOT NULL DEFAULT 0,
+                log_group_id    INTEGER REFERENCES log_groups(id),
+                timestamp       REAL NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_tc_log_group
@@ -68,27 +78,73 @@ class LogDB:
         """)
         self._conn.commit()
 
+    @staticmethod
+    def encode_sent(writes: list[bytes]) -> Optional[str]:
+        """
+        Encode a list of raw byte writes as a newline-separated hex string.
+        Returns None if the list is empty.
+
+        Example: [b'\\x40\\x41', b'\\x68\\x43'] -> '4041\\n6843'
+        """
+        if not writes:
+            return None
+        return "\n".join(w.hex() for w in writes)
+
+    @staticmethod
+    def decode_sent(sent_data: Optional[str]) -> list[bytes]:
+        """
+        Decode a newline-separated hex string back to a list of byte writes.
+        Returns an empty list if sent_data is None or empty.
+        """
+        if not sent_data:
+            return []
+        return [bytes.fromhex(h) for h in sent_data.splitlines()]
+
     def record_test_case(
         self,
-        index: int,
-        sent_data: bytes | None,
-        lines: list[str],
+        index: Optional[int],
+        sent_writes: list[bytes],
+        is_healthcheck: bool = False,
+        lines: Optional[list[str]] = None,
     ) -> int:
         """
-        Record a test case and its server output.
+        Record a test case and optionally its server output.
 
-        If the exact same output was seen before, reuses the existing
-        log_group. Returns the test_case id.
+        sent_writes: list of raw byte payloads sent in order within this session.
+        lines: server log lines for this test case (stored in log_groups).
+               Pass None or [] if log correlation will be done later by analyze_logs.py.
+
+        Returns the new test_case id.
         """
+        sent_data = self.encode_sent(sent_writes)
         log_group_id = self._get_or_create_log_group(lines) if lines else None
 
         cur = self._conn.execute(
-            "INSERT INTO test_cases (test_index, sent_data, log_group_id, timestamp) "
-            "VALUES (?, ?, ?, ?)",
-            (index, sent_data, log_group_id, time.time()),
+            "INSERT INTO test_cases "
+            "(test_index, sent_data, is_healthcheck, log_group_id, timestamp) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (index, sent_data, int(is_healthcheck), log_group_id, time.time()),
         )
         self._conn.commit()
-        return cur.lastrowid  # type: ignore[return-value]
+        assert cur.lastrowid is not None
+        return cur.lastrowid
+
+    def set_log_group(self, test_case_id: int, log_group_id: int) -> None:
+        """Update the log_group_id for an existing test case (used by analyze_logs.py)."""
+        self._conn.execute(
+            "UPDATE test_cases SET log_group_id = ? WHERE id = ?",
+            (log_group_id, test_case_id),
+        )
+        self._conn.commit()
+
+    def get_test_cases(self) -> list[dict]:
+        """Return all test cases ordered by id."""
+        cur = self._conn.execute(
+            "SELECT id, test_index, sent_data, is_healthcheck, log_group_id, timestamp "
+            "FROM test_cases ORDER BY id"
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def _get_or_create_log_group(self, lines: list[str]) -> int:
         """Find or create a log_group for the given output lines."""
@@ -108,7 +164,8 @@ class LogDB:
             (fingerprint, raw_text),
         )
         self._conn.commit()
-        return cur.lastrowid  # type: ignore[return-value]
+        assert cur.lastrowid is not None
+        return cur.lastrowid
 
     def close(self):
         """Close the database connection."""

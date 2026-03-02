@@ -55,7 +55,9 @@ def main():
         "--server-cmd",
         type=str,
         default=None,
-        help="Shell command to launch the target server as a subprocess (e.g. 'python server.py cert.pem key.pem')",
+        help="Shell command to launch the target server as a subprocess. "
+        "Redirect its stdout to a log file for later analysis with analyze_logs.py, e.g.: "
+        "'python server.py cert.pem key.pem 2>/dev/null | tee server.log'",
     )
     parser.add_argument(
         "--server-startup-delay",
@@ -64,10 +66,10 @@ def main():
         help="Seconds to wait after launching server before fuzzing (default: 1.0)",
     )
     parser.add_argument(
-        "--server-log-delay",
-        type=int,
-        default=250,
-        help="Milliseconds to wait for server logs after each test case (default: 250)",
+        "--db",
+        type=str,
+        default=None,
+        help="Path to the SQLite log database. Defaults to boofuzz-results/run_<timestamp>.db",
     )
     args = parser.parse_args()
 
@@ -86,25 +88,15 @@ def main():
 
     # ---- Server subprocess management ----
     server_manager = None
-    log_db = None
 
     if args.server_cmd:
         from src.server_manager import ServerManager
-        from src.log_db import LogDB
 
         server_manager = ServerManager(
             cmd=args.server_cmd,
             startup_delay=args.server_startup_delay,
         )
         server_manager.start()
-
-        # Log DB alongside boofuzz results
-        os.makedirs("boofuzz-results", exist_ok=True)
-        log_db_path = os.path.join(
-            "boofuzz-results", f"server_logs_{int(time.time())}.db"
-        )
-        log_db = LogDB(log_db_path)
-        logger.info("Server log database: %s", log_db_path)
 
     if args.no_fuzz:
         logger.info("Running in VALIDATION MODE (--no-fuzz)")
@@ -131,6 +123,17 @@ def main():
         logger.info("Running in ONE-SHOT FUZZING MODE")
         logger.info("Press Ctrl+C to stop")
 
+        # ---- Log DB setup ----
+        from src.log_db import LogDB
+        from src.request_logger import RequestLogger
+
+        os.makedirs("boofuzz-results", exist_ok=True)
+        log_db_path = args.db or os.path.join(
+            "boofuzz-results", f"run_{int(time.time())}.db"
+        )
+        log_db = LogDB(log_db_path)
+        logger.info("Log database: %s", log_db_path)
+
         # Single connection — always capsule mode (writes to CONNECT stream)
         connection = WebTransportConnection(
             target_url, timeout=3.0, send_mode="capsule"
@@ -140,13 +143,7 @@ def main():
         if not args.no_healthcheck:
             monitors.append(EchoCompareMonitor(crash_on_mismatch=True))
 
-        # Add server log monitor if server is managed
-        if server_manager and log_db:
-            from src.server_log_monitor import ServerLogMonitor
-
-            monitors.append(
-                ServerLogMonitor(server_manager, log_db, delay_ms=args.server_log_delay)
-            )
+        monitors.append(RequestLogger(log_db))
 
         target = Target(connection=connection, monitors=monitors)
 
@@ -155,7 +152,7 @@ def main():
             fuzz_loggers=[],  # Web GUI at :26000 handles its own DB
             db_filename=":memory:",  # Don't write boofuzz's default run-*.db to disk
             sleep_time=0.0,
-            restart_sleep_time=0.0,
+            restart_sleep_time=0,
             reuse_target_connection=False,
             index_start=args.start_index,
             index_end=args.end_index,
@@ -178,9 +175,12 @@ def main():
             logger.exception("Fuzzing encountered an unexpected error")
         finally:
             logger.info("Fuzzing session finished")
-            if log_db:
-                logger.info("Server logs saved to: %s", log_db_path)
-                log_db.close()
+            logger.info("Log database: %s", log_db_path)
+            logger.info(
+                "Run analyze_logs.py --log <server.log> --db %s to correlate server output.",
+                log_db_path,
+            )
+            log_db.close()
             if server_manager:
                 server_manager.stop()
 
