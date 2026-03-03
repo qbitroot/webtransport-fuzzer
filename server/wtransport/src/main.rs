@@ -144,8 +144,9 @@ async fn run_session(
                 info!("Received (uni) '{str_data}' from client");
 
                 let mut send_stream = connection.open_uni().await?.await?;
+                let echo_stream_id = send_stream.id().into_u64();
                 send_stream.write_all(b"ACK").await?;
-                wtfuzz!(conn_idx, "ECHO", type = "uni", stream_id = stream_id);
+                wtfuzz!(conn_idx, "ECHO", type = "uni", stream_id = echo_stream_id);
             }
             dgram = connection.receive_datagram() => {
                 let dgram = dgram?;
