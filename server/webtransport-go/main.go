@@ -10,13 +10,13 @@ package main
 //
 // Event catalog:
 //   SERVER_READY    bind=<host>:<port>
-//   SESSION_OPEN    session_id=<id>
-//   SESSION_CLOSE   session_id=<id>
-//   RECV_BIDI       stream_id=<id>
-//   RECV_UNI        stream_id=<id>
-//   RECV_DATAGRAM   session_id=<id>
-//   ECHO            type=<bidi|uni|datagram>  stream_id=<id> or session_id=<id>
-//   STREAM_RESET    stream_id=<id>  error_code=<code>
+//   SESSION_OPEN
+//   SESSION_CLOSE
+//   RECV_BIDI
+//   RECV_UNI
+//   RECV_DATAGRAM
+//   ECHO            type=<bidi|uni|datagram>
+//   STREAM_RESET    error_code=<code>
 // ---------------------------------------------------------------------------
 
 import (
@@ -42,9 +42,6 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	webtransport "github.com/quic-go/webtransport-go"
 )
-
-// streamCounter generates monotonically increasing IDs across all sessions.
-var streamCounter atomic.Uint64
 
 const bindAddr = "0.0.0.0:6161"
 
@@ -104,7 +101,6 @@ func main() {
 		go handleSession(connIdx, sess)
 	})
 
-	log.Printf("Server ready on %s", bindAddr)
 	wtfuzz(0, "SERVER_READY", "bind", bindAddr)
 
 	if err := s.ListenAndServe(); err != nil {
@@ -113,10 +109,7 @@ func main() {
 }
 
 func handleSession(connIdx uint64, sess *webtransport.Session) {
-	sessionID := connIdx // use connIdx as a stable session identifier
-
-	wtfuzz(connIdx, "SESSION_OPEN", "session_id", fmt.Sprintf("%d", sessionID))
-	log.Printf("conn %d: session open", connIdx)
+	wtfuzz(connIdx, "SESSION_OPEN")
 
 	ctx := sess.Context()
 
@@ -127,7 +120,7 @@ func handleSession(connIdx uint64, sess *webtransport.Session) {
 			if err != nil {
 				return
 			}
-			go handleBidi(connIdx, sessionID, sess, stream)
+			go handleBidi(connIdx, stream)
 		}
 	}()
 
@@ -138,7 +131,7 @@ func handleSession(connIdx uint64, sess *webtransport.Session) {
 			if err != nil {
 				return
 			}
-			go handleUni(connIdx, sessionID, sess, stream)
+			go handleUni(connIdx, sess, stream)
 		}
 	}()
 
@@ -149,88 +142,68 @@ func handleSession(connIdx uint64, sess *webtransport.Session) {
 			if err != nil {
 				return
 			}
-			handleDatagram(connIdx, sessionID, sess, data)
+			handleDatagram(connIdx, sess, data)
 		}
 	}()
 
 	// wait for session to end
 	<-ctx.Done()
 
-	wtfuzz(connIdx, "SESSION_CLOSE", "session_id", fmt.Sprintf("%d", sessionID))
-	log.Printf("conn %d: session closed", connIdx)
+	wtfuzz(connIdx, "SESSION_CLOSE")
 }
 
-func handleBidi(connIdx, sessionID uint64, _ *webtransport.Session, stream *webtransport.Stream) {
-	streamID := streamCounter.Add(1) - 1
-	wtfuzz(connIdx, "RECV_BIDI", "stream_id", fmt.Sprintf("%d", streamID))
-	log.Printf("conn %d: bidi stream %d opened", connIdx, streamID)
+func handleBidi(connIdx uint64, stream *webtransport.Stream) {
+	wtfuzz(connIdx, "RECV_BIDI")
 
 	buf, err := io.ReadAll(stream)
 	if err != nil {
 		var streamErr *webtransport.StreamError
 		if isStreamError(err, &streamErr) {
-			wtfuzz(connIdx, "STREAM_RESET",
-				"stream_id", fmt.Sprintf("%d", streamID),
-				"error_code", fmt.Sprintf("%d", streamErr.ErrorCode))
+			wtfuzz(connIdx, "STREAM_RESET", "error_code", fmt.Sprintf("%d", streamErr.ErrorCode))
 		}
-		log.Printf("conn %d: bidi stream %d read error: %v", connIdx, streamID, err)
 		return
 	}
 
-	log.Printf("conn %d: bidi stream %d received %d bytes: %q", connIdx, streamID, len(buf), buf)
-
-	if _, err := stream.Write([]byte("ACK")); err != nil {
-		log.Printf("conn %d: bidi stream %d write error: %v", connIdx, streamID, err)
+	if _, err := stream.Write(buf); err != nil {
 		return
 	}
 	stream.Close()
 
-	wtfuzz(connIdx, "ECHO", "type", "bidi", "stream_id", fmt.Sprintf("%d", streamID))
+	wtfuzz(connIdx, "ECHO", "type", "bidi")
 }
 
-func handleUni(connIdx, sessionID uint64, sess *webtransport.Session, recv *webtransport.ReceiveStream) {
-	streamID := streamCounter.Add(1) - 1
-	wtfuzz(connIdx, "RECV_UNI", "stream_id", fmt.Sprintf("%d", streamID))
-	log.Printf("conn %d: uni stream %d opened", connIdx, streamID)
+func handleUni(connIdx uint64, sess *webtransport.Session, recv *webtransport.ReceiveStream) {
+	wtfuzz(connIdx, "RECV_UNI")
 
 	buf, err := io.ReadAll(recv)
 	if err != nil {
 		var streamErr *webtransport.StreamError
 		if isStreamError(err, &streamErr) {
-			wtfuzz(connIdx, "STREAM_RESET",
-				"stream_id", fmt.Sprintf("%d", streamID),
-				"error_code", fmt.Sprintf("%d", streamErr.ErrorCode))
+			wtfuzz(connIdx, "STREAM_RESET", "error_code", fmt.Sprintf("%d", streamErr.ErrorCode))
 		}
-		log.Printf("conn %d: uni stream %d read error: %v", connIdx, streamID, err)
 		return
 	}
-
-	log.Printf("conn %d: uni stream %d received %d bytes: %q", connIdx, streamID, len(buf), buf)
 
 	send, err := sess.OpenUniStreamSync(context.Background())
 	if err != nil {
-		log.Printf("conn %d: failed to open send stream: %v", connIdx, err)
 		return
 	}
-	if _, err := send.Write([]byte("ACK")); err != nil {
-		log.Printf("conn %d: uni send stream write error: %v", connIdx, err)
+	if _, err := send.Write(buf); err != nil {
 		return
 	}
 	send.Close()
 
-	wtfuzz(connIdx, "ECHO", "type", "uni", "stream_id", fmt.Sprintf("%d", streamID))
+	wtfuzz(connIdx, "ECHO", "type", "uni")
 }
 
-func handleDatagram(connIdx, sessionID uint64, sess *webtransport.Session, data []byte) {
-	wtfuzz(connIdx, "RECV_DATAGRAM", "session_id", fmt.Sprintf("%d", sessionID))
-	log.Printf("conn %d: datagram received %d bytes: %q", connIdx, len(data), data)
+func handleDatagram(connIdx uint64, sess *webtransport.Session, data []byte) {
+	wtfuzz(connIdx, "RECV_DATAGRAM")
 
-	if err := sess.SendDatagram([]byte("ACK")); err != nil {
-		log.Printf("conn %d: datagram send error: %v", connIdx, err)
+	if err := sess.SendDatagram(data); err != nil {
 		return
 	}
 
-	wtfuzz(connIdx, "ECHO", "type", "datagram", "session_id", fmt.Sprintf("%d", sessionID))
+	wtfuzz(connIdx, "ECHO", "type", "datagram")
 }
 
 // isStreamError checks if err wraps a *webtransport.StreamError.
@@ -238,7 +211,6 @@ func isStreamError(err error, target **webtransport.StreamError) bool {
 	if err == nil {
 		return false
 	}
-	// webtransport.StreamError implements Is via pointer receiver; use errors.As pattern manually.
 	type unwrapper interface{ Unwrap() error }
 	for e := err; e != nil; {
 		if se, ok := e.(*webtransport.StreamError); ok {
