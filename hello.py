@@ -74,17 +74,18 @@ async def interactive_mode(client: WebTransportClient):
                 if cmd_type == "d":
                     client.send_datagram(data)
                     logger.info("Sent datagram: %s", message)
+                    echo = await client.receive_datagram(timeout=2.0)
+                    _check_echo("datagram", data, echo)
                 elif cmd_type == "u":
                     await client.send_unidirectional_stream(data)
                     logger.info("Sent unidirectional stream: %s", message)
+                    result = await client.receive_stream_data(timeout=2.0)
+                    echo = result[1] if result else None
+                    _check_echo("uni stream", data, echo)
                 elif cmd_type == "b":
                     stream_id, response = await client.send_bidirectional_stream(data)
                     logger.info("Sent bidirectional stream: %s", message)
-                    if response:
-                        logger.info(
-                            "Received response: %s",
-                            response.decode("utf-8", errors="ignore"),
-                        )
+                    _check_echo("bidi stream", data, response)
                 else:
                     print(f"Unknown command: {cmd_type}")
 
@@ -96,40 +97,96 @@ async def interactive_mode(client: WebTransportClient):
             logger.error("Error in interactive mode: %s", e)
 
 
+def _check_echo(test_name: str, sent: bytes, received: bytes | None) -> bool:
+    """Compare sent vs received bytes and log the result. Returns True on match."""
+    if received is None:
+        logger.error("%s: FAIL - no response received", test_name)
+        return False
+    if received == sent:
+        logger.info("%s: PASS - echo matches (%d bytes)", test_name, len(received))
+        return True
+    logger.error(
+        "%s: FAIL - echo mismatch\n  sent:     %s\n  received: %s",
+        test_name,
+        sent,
+        received,
+    )
+    return False
+
+
 async def demo_mode(client: WebTransportClient):
     """Automated demo mode."""
     logger.info("\n" + "=" * 60)
     logger.info("Running automated demo...")
     logger.info("=" * 60 + "\n")
 
-    # Test 1: Send a datagram
+    passed = 0
+    failed = 0
+
+    # Test 1: Send a datagram and verify echo
     logger.info("Test 1: Sending datagram...")
-    client.send_datagram(b"Hello via datagram!")
-    await asyncio.sleep(0.5)
+    dgram_payload = b"Hello via datagram!"
+    client.send_datagram(dgram_payload)
+    echo = await client.receive_datagram(timeout=2.0)
+    if _check_echo("Test 1 (datagram)", dgram_payload, echo):
+        passed += 1
+    else:
+        failed += 1
 
-    # Test 2: Send unidirectional stream
+    # Test 2: Send unidirectional stream and verify echo on new uni stream
     logger.info("\nTest 2: Sending unidirectional stream...")
-    await client.send_unidirectional_stream(b"Hello via unidirectional stream!")
-    await asyncio.sleep(0.5)
+    uni_payload = b"Hello via unidirectional stream!"
+    await client.send_unidirectional_stream(uni_payload)
+    result = await client.receive_stream_data(timeout=2.0)
+    echo = result[1] if result else None
+    if _check_echo("Test 2 (uni stream)", uni_payload, echo):
+        passed += 1
+    else:
+        failed += 1
 
-    # Test 3: Send bidirectional stream
+    # Test 3: Send bidirectional stream and verify echo
     logger.info("\nTest 3: Sending bidirectional stream...")
-    stream_id, response = await client.send_bidirectional_stream(
-        b"Hello via bidirectional stream!"
-    )
-    if response:
-        logger.info("Received response: %s", response.decode("utf-8", errors="ignore"))
-    await asyncio.sleep(0.5)
+    bidi_payload = b"Hello via bidirectional stream!"
+    stream_id, response = await client.send_bidirectional_stream(bidi_payload)
+    if _check_echo("Test 3 (bidi stream)", bidi_payload, response):
+        passed += 1
+    else:
+        failed += 1
 
-    # Test 4: Multiple datagrams
+    # Test 4: Multiple datagrams - send all then verify all echoes
     logger.info("\nTest 4: Sending multiple datagrams...")
-    for i in range(3):
-        client.send_datagram(f"Datagram #{i + 1}".encode())
-        await asyncio.sleep(0.2)
+    dgram_payloads = [f"Datagram #{i + 1}".encode() for i in range(3)]
+    for payload in dgram_payloads:
+        client.send_datagram(payload)
+        await asyncio.sleep(0.1)
 
-    await asyncio.sleep(1.0)
+    # Collect all echoed datagrams
+    received_dgrams: list[bytes] = []
+    for _ in dgram_payloads:
+        echo = await client.receive_datagram(timeout=2.0)
+        if echo is not None:
+            received_dgrams.append(echo)
+
+    # Check that every sent datagram was echoed (order may vary)
+    sent_set = sorted(dgram_payloads)
+    recv_set = sorted(received_dgrams)
+    if sent_set == recv_set:
+        logger.info(
+            "Test 4 (multi-datagram): PASS - all %d datagrams echoed correctly",
+            len(dgram_payloads),
+        )
+        passed += 1
+    else:
+        logger.error(
+            "Test 4 (multi-datagram): FAIL\n  sent:     %s\n  received: %s",
+            sent_set,
+            recv_set,
+        )
+        failed += 1
+
+    await asyncio.sleep(0.5)
     logger.info("\n" + "=" * 60)
-    logger.info("Demo complete!")
+    logger.info("Demo complete!  %d passed, %d failed", passed, failed)
     logger.info("=" * 60)
 
 

@@ -104,6 +104,19 @@ async fn handle_connection_impl(conn_idx: u64, incoming_session: IncomingSession
     result
 }
 
+/// Read all chunks from a RecvStream until EOF, accumulating into a Vec.
+/// Uses the wtransport native read() API (not AsyncRead).
+async fn read_all(stream: &mut wtransport::RecvStream, buffer: &mut [u8]) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    loop {
+        match stream.read(buffer).await? {
+            None => break,                          // stream closed / EOF
+            Some(n) => payload.extend_from_slice(&buffer[..n]),
+        }
+    }
+    Ok(payload)
+}
+
 async fn run_session(
     conn_idx: u64,
     connection: &wtransport::Connection,
@@ -119,14 +132,11 @@ async fn run_session(
                 let stream_id = stream.1.id().into_u64();
                 wtfuzz!(conn_idx, "RECV_BIDI", stream_id = stream_id);
 
-                let Some(bytes_read) = stream.1.read(buffer).await? else {
-                    continue;
-                };
+                // Read entire payload then echo it back on the same bidi stream.
+                let payload = read_all(&mut stream.1, buffer).await?;
+                info!("Received (bi) {} bytes from client", payload.len());
 
-                let str_data = std::str::from_utf8(&buffer[..bytes_read])?;
-                info!("Received (bi) '{str_data}' from client");
-
-                stream.0.write_all(b"ACK").await?;
+                stream.0.write_all(&payload).await?;
                 wtfuzz!(conn_idx, "ECHO", type = "bidi", stream_id = stream_id);
             }
             stream = connection.accept_uni() => {
@@ -136,25 +146,21 @@ async fn run_session(
                 let stream_id = stream.id().into_u64();
                 wtfuzz!(conn_idx, "RECV_UNI", stream_id = stream_id);
 
-                let Some(bytes_read) = stream.read(buffer).await? else {
-                    continue;
-                };
-
-                let str_data = std::str::from_utf8(&buffer[..bytes_read])?;
-                info!("Received (uni) '{str_data}' from client");
+                // Read entire payload then echo it back on a new uni stream.
+                let payload = read_all(&mut stream, buffer).await?;
+                info!("Received (uni) {} bytes from client", payload.len());
 
                 let mut send_stream = connection.open_uni().await?.await?;
                 let echo_stream_id = send_stream.id().into_u64();
-                send_stream.write_all(b"ACK").await?;
+                send_stream.write_all(&payload).await?;
                 wtfuzz!(conn_idx, "ECHO", type = "uni", stream_id = echo_stream_id);
             }
             dgram = connection.receive_datagram() => {
                 let dgram = dgram?;
-                let str_data = std::str::from_utf8(&dgram)?;
-                info!("Received (dgram) '{str_data}' from client");
+                info!("Received (dgram) {} bytes from client", dgram.len());
 
                 wtfuzz!(conn_idx, "RECV_DATAGRAM", session_id = session_id);
-                connection.send_datagram(b"ACK")?;
+                connection.send_datagram(&*dgram)?;
                 wtfuzz!(conn_idx, "ECHO", type = "datagram", session_id = session_id);
             }
         }
