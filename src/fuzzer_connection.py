@@ -261,15 +261,22 @@ class WebTransportConnection(ITargetConnection):
             logger.error("Health check skipped: connection not open")
             return False
 
+        PROBE = b"HEALTHCHECK"
+
         async def _health_check():
             try:
-                # Send explicit health check payload
                 sid, response = await self._protocol.send_bidirectional_stream(
-                    b"HEALTHCHECK", timeout=1.0
+                    PROBE, timeout=1.0
                 )
-                if response:
-                    logger.debug("Health check response: %s", response)
+                if response == PROBE:
+                    logger.debug("Health check echo matched")
                     return True
+                if response:
+                    logger.warning(
+                        "Health check echo mismatch: sent %r, got %r", PROBE, response
+                    )
+                    return False
+                logger.warning("Health check: no response received")
                 return False
             except Exception as e:
                 logger.warning("Health check failed: %s", e)
