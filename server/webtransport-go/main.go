@@ -10,17 +10,16 @@ package main
 //
 // Event catalog:
 //   SERVER_READY    bind=<host>:<port>
-//   SESSION_OPEN
-//   SESSION_CLOSE
-//   RECV_BIDI
-//   RECV_UNI
-//   RECV_DATAGRAM
-//   ECHO            type=<bidi|uni|datagram>
-//   STREAM_RESET    error_code=<code>
+//   SESSION_OPEN    session_id=<id>
+//   SESSION_CLOSE   session_id=<id>
+//   RECV_BIDI       stream_id=<id>
+//   RECV_UNI        stream_id=<id>
+//   RECV_DATAGRAM   session_id=<id>
+//   ECHO            type=<bidi|uni|datagram>  stream_id=<id> or session_id=<id>
+//   STREAM_RESET    stream_id=<id>  error_code=<code>
 // ---------------------------------------------------------------------------
 
 import (
-	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -45,17 +44,16 @@ import (
 
 const bindAddr = "0.0.0.0:6161"
 
-// stdout is a buffered, line-flushing writer for WTFUZZ lines.
-var stdout = bufio.NewWriter(os.Stdout)
-
-// wtfuzz emits a structured WTFUZZ line to stdout and flushes immediately.
+// wtfuzz emits a structured WTFUZZ line to stdout.
+// fmt.Fprintln on os.Stdout issues a single write(2) syscall, which is
+// atomic for lines shorter than PIPE_BUF (4096 bytes on Linux), so no
+// mutex or buffering is needed.
 func wtfuzz(connIdx uint64, event string, kvs ...string) {
 	line := fmt.Sprintf("WTFUZZ|%d|%s", connIdx, event)
 	for i := 0; i+1 < len(kvs); i += 2 {
 		line += fmt.Sprintf("|%s=%s", kvs[i], kvs[i+1])
 	}
-	fmt.Fprintln(stdout, line)
-	stdout.Flush()
+	fmt.Fprintln(os.Stdout, line)
 }
 
 func main() {
@@ -93,7 +91,6 @@ func main() {
 
 		sess, err := s.Upgrade(w, r)
 		if err != nil {
-			log.Printf("conn %d: upgrade failed: %v", connIdx, err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -155,6 +152,10 @@ func handleSession(connIdx uint64, sess *webtransport.Session) {
 func handleBidi(connIdx uint64, stream *webtransport.Stream) {
 	wtfuzz(connIdx, "RECV_BIDI")
 
+	// Per-stream deadline so a session-level cancellation (e.g. from a
+	// malformed capsule) does not silently abort an in-flight read.
+	stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+
 	buf, err := io.ReadAll(stream)
 	if err != nil {
 		var streamErr *webtransport.StreamError
@@ -164,6 +165,7 @@ func handleBidi(connIdx uint64, stream *webtransport.Stream) {
 		return
 	}
 
+	stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := stream.Write(buf); err != nil {
 		return
 	}
@@ -174,6 +176,9 @@ func handleBidi(connIdx uint64, stream *webtransport.Stream) {
 
 func handleUni(connIdx uint64, sess *webtransport.Session, recv *webtransport.ReceiveStream) {
 	wtfuzz(connIdx, "RECV_UNI")
+
+	// Per-stream deadline so a session-level cancellation does not abort reads.
+	recv.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	buf, err := io.ReadAll(recv)
 	if err != nil {
@@ -188,6 +193,7 @@ func handleUni(connIdx uint64, sess *webtransport.Session, recv *webtransport.Re
 	if err != nil {
 		return
 	}
+	send.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := send.Write(buf); err != nil {
 		return
 	}
