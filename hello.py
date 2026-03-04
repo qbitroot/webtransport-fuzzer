@@ -190,6 +190,112 @@ async def demo_mode(client: WebTransportClient):
     logger.info("=" * 60)
 
 
+async def scenario_mode(client: WebTransportClient):
+    """Scenario interpreter mode.
+
+    Reads a scenario from stdin: one step per line in action(hex) format.
+    The first empty line (or EOF) terminates input and the scenario executes.
+
+    Supported actions:
+      uni(hex)      - unidirectional stream
+      bidi(hex)     - bidirectional stream
+      datagram(hex) - QUIC datagram
+      capsule(hex)  - raw capsule on CONNECT stream
+      sleep(Xs)     - pause, e.g. sleep(0.5s)
+    """
+    import re
+
+    print("\n" + "=" * 60)
+    print("WebTransport Echo Client - Scenario Mode")
+    print("=" * 60)
+    print("Paste steps (one per line), then an empty line to run:")
+    print("  uni(hex)        unidirectional stream")
+    print("  bidi(hex)       bidirectional stream")
+    print("  datagram(hex)   QUIC datagram")
+    print("  capsule(hex)    raw capsule on CONNECT stream")
+    print("  sleep(Xs)       pause (e.g. sleep(0.5s))")
+    print("=" * 60 + "\n")
+
+    steps = []
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            line = await loop.run_in_executor(None, input, "")
+        except EOFError:
+            break
+        line = line.strip()
+        if not line:
+            break
+        steps.append(line)
+
+    if not steps:
+        print("No steps entered, nothing to do.")
+        return
+
+    print(f"\nExecuting {len(steps)} step(s)...\n")
+
+    step_re = re.compile(r"^(\w+)\(([^)]*)\)$")
+
+    for step in steps:
+        m = step_re.match(step)
+        if not m:
+            logger.error("Unrecognised step (skipping): %s", step)
+            continue
+
+        action, arg = m.group(1), m.group(2)
+
+        if action == "sleep":
+            # parse e.g. "0.5s" or "1s"
+            secs_str = arg.rstrip("s")
+            try:
+                secs = float(secs_str)
+            except ValueError:
+                logger.error("Invalid sleep duration: %s", arg)
+                continue
+            logger.info("sleep(%.3fs)", secs)
+            await asyncio.sleep(secs)
+
+        elif action in ("uni", "bidi", "datagram", "capsule"):
+            try:
+                data = bytes.fromhex(arg)
+            except ValueError as e:
+                logger.error("Invalid hex in %s: %s", step, e)
+                continue
+
+            if action == "uni":
+                await client.send_unidirectional_stream(data)
+                logger.info("uni(%s) — sent %d bytes", arg, len(data))
+                result = await client.receive_stream_data(timeout=2.0)
+                echo = result[1] if result else None
+                _check_echo(f"uni({arg})", data, echo)
+
+            elif action == "bidi":
+                stream_id, response = await client.send_bidirectional_stream(data)
+                logger.info(
+                    "bidi(%s) — sent %d bytes on stream %d", arg, len(data), stream_id
+                )
+                _check_echo(f"bidi({arg})", data, response)
+
+            elif action == "datagram":
+                client.send_datagram(data)
+                logger.info("datagram(%s) — sent %d bytes", arg, len(data))
+                echo = await client.receive_datagram(timeout=2.0)
+                _check_echo(f"datagram({arg})", data, echo)
+
+            elif action == "capsule":
+                client.send_capsule(data)
+                logger.info(
+                    "capsule(%s) — sent %d bytes on CONNECT stream", arg, len(data)
+                )
+
+        else:
+            logger.error("Unknown action '%s' (skipping)", action)
+
+        await asyncio.sleep(0.1)
+
+    print("\nScenario complete.")
+
+
 async def main():
     # Get mkcert CA root path
     import os
@@ -214,6 +320,9 @@ async def main():
     )
     parser.add_argument(
         "--interactive", "-i", action="store_true", help="Run in interactive mode"
+    )
+    parser.add_argument(
+        "--scenario", "-s", action="store_true", help="Run in scenario interpreter mode"
     )
     args = parser.parse_args()
 
@@ -246,7 +355,9 @@ async def main():
     ) as client:
         await client.establish_session(authority, args.path)
 
-        if args.interactive:
+        if args.scenario:
+            await scenario_mode(client)
+        elif args.interactive:
             await interactive_mode(client)
         else:
             await demo_mode(client)
