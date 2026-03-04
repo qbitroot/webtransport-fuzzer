@@ -15,9 +15,12 @@ unexpected output (panics, exceptions, etc.), it is captured alongside the
 structured lines, making anomalies immediately visible by their deviation
 from the expected pattern.
 
-sent_data is stored as newline-separated hex strings, one per write:
-    "4041ff\n6843"
-means two writes were sent in sequence within the same session.
+sent_data is stored as newline-separated step strings, one per step:
+    oneshot:   "capsule(6843040000000000)"
+    multistep: "bidi(48454c4c4f)\\ncapsule(800078ae00)\\ncapsule(68430400000000)"
+
+Each line is of the form  action(hex-payload)  where action is one of:
+capsule, bidi, uni, datagram, sleep.
 """
 
 import hashlib
@@ -41,11 +44,11 @@ class LogDB:
         test_cases   — each fuzzer request, pointing to a log_group
 
     sent_data is stored as newline-separated hex strings (one per write).
-    Use encode_sent() / decode_sent() to convert to/from raw bytes.
+    Use encode_sent() / decode_sent() to convert to/from step strings.
 
     Usage:
         db = LogDB("fuzzer_logs.db")
-        db.record_test_case(index=42, sent_writes=[b"\\x00\\x01"], is_healthcheck=False)
+        db.record_test_case(index=42, sent_steps=["capsule(0001)"], is_healthcheck=False)
         db.close()
     """
 
@@ -79,44 +82,47 @@ class LogDB:
         self._conn.commit()
 
     @staticmethod
-    def encode_sent(writes: list[bytes]) -> Optional[str]:
+    def encode_sent(steps: list[str]) -> Optional[str]:
         """
-        Encode a list of raw byte writes as a newline-separated hex string.
+        Join pre-formatted step strings into a newline-separated column value.
         Returns None if the list is empty.
 
-        Example: [b'\\x40\\x41', b'\\x68\\x43'] -> '4041\\n6843'
+        Each step is already in "action(hex)" form, e.g.:
+            "capsule(6843040000000000)"
+            "bidi(48454c4c4f)"
         """
-        if not writes:
+        if not steps:
             return None
-        return "\n".join(w.hex() for w in writes)
+        return "\n".join(steps)
 
     @staticmethod
-    def decode_sent(sent_data: Optional[str]) -> list[bytes]:
+    def decode_sent(sent_data: Optional[str]) -> list[str]:
         """
-        Decode a newline-separated hex string back to a list of byte writes.
+        Split a stored sent_data column back into individual step strings.
         Returns an empty list if sent_data is None or empty.
         """
         if not sent_data:
             return []
-        return [bytes.fromhex(h) for h in sent_data.splitlines()]
+        return sent_data.splitlines()
 
     def record_test_case(
         self,
         index: Optional[int],
-        sent_writes: list[bytes],
+        sent_steps: list[str],
         is_healthcheck: bool = False,
         lines: Optional[list[str]] = None,
     ) -> int:
         """
         Record a test case and optionally its server output.
 
-        sent_writes: list of raw byte payloads sent in order within this session.
+        sent_steps: list of pre-formatted step strings in "action(hex)" form,
+                    one per step sent within the session.
         lines: server log lines for this test case (stored in log_groups).
                Pass None or [] if log correlation will be done later by analyze_logs.py.
 
         Returns the new test_case id.
         """
-        sent_data = self.encode_sent(sent_writes)
+        sent_data = self.encode_sent(sent_steps)
         log_group_id = self._get_or_create_log_group(lines) if lines else None
 
         cur = self._conn.execute(

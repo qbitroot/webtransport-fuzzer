@@ -10,7 +10,7 @@ from boofuzz import Session, Target
 
 from src.fuzzer_connection import WebTransportConnection
 from src.echo_monitor import EchoCompareMonitor, ServerDownError
-from src.boofuzz_definitions import define_oneshot_capsule
+from src.boofuzz_definitions import define_oneshot_capsule, define_multistep
 
 # ---- Logging setup ----
 LOG_FMT = "%(asctime)s [%(levelname)5s] %(name)s: %(message)s"
@@ -24,7 +24,7 @@ os.makedirs(FAILURES_DIR, exist_ok=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="WebTransport One-Shot Fuzzer")
+    parser = argparse.ArgumentParser(description="WebTransport Protocol Fuzzer")
     parser.add_argument("--url", default="https://0.0.0.0:6161/echo", help="Target URL")
     parser.add_argument(
         "--no-fuzz",
@@ -33,9 +33,11 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["oneshot"],
+        choices=["oneshot", "multistep"],
         default="oneshot",
-        help="Fuzzing mode (default: oneshot)",
+        help="Fuzzing mode: oneshot (single malformed capsule), "
+        "multistep (scenarios with interleaved data streams + capsules) "
+        "(default: oneshot)",
     )
     parser.add_argument(
         "--no-healthcheck",
@@ -75,16 +77,22 @@ def main():
 
     target_url = args.url
 
+    mode_desc = {
+        "oneshot": "One-Shot (single malformed capsule per connection)",
+        "multistep": "Multistep (data streams + capsule sequences)",
+    }
+
     print(
-        """
+        f"""
     ╔═══════════════════════════════════════════════════════╗
-    ║   WebTransport One-Shot Fuzzer - Protocol Level        ║
+    ║   WebTransport Protocol Fuzzer                         ║
     ║   Target: WebTransport over HTTP/3 Framing             ║
-    ║   Mode: One-Shot (fuzz → health check per request)     ║
+    ║   Mode: {mode_desc[args.mode]:<47s}║
     ╚═══════════════════════════════════════════════════════╝
     """
     )
     logger.info("Target: %s", target_url)
+    logger.info("Mode: %s", args.mode)
 
     # ---- Server subprocess management ----
     server_manager = None
@@ -120,7 +128,7 @@ def main():
             logger.exception("Validation encountered an error")
 
     else:
-        logger.info("Running in ONE-SHOT FUZZING MODE")
+        logger.info("Running in %s FUZZING MODE", args.mode.upper())
         logger.info("Press Ctrl+C to stop")
 
         # ---- Log DB setup ----
@@ -134,10 +142,24 @@ def main():
         log_db = LogDB(log_db_path)
         logger.info("Log database: %s", log_db_path)
 
-        # Single connection — always capsule mode (writes to CONNECT stream)
+        # ---- Select send mode and boofuzz definition based on --mode ----
+        if args.mode == "oneshot":
+            send_mode = "capsule"
+            msg = define_oneshot_capsule(session_name="wt_oneshot")
+        elif args.mode == "multistep":
+            send_mode = "scenario"
+            msg = define_multistep(session_name="wt_multistep")
+        else:
+            logger.error("Unknown mode: %s", args.mode)
+            sys.exit(1)
+
         connection = WebTransportConnection(
-            target_url, timeout=3.0, send_mode="capsule"
+            target_url, timeout=3.0, send_mode=send_mode
         )
+
+        # Log mutation count
+        num_mutations = msg.num_mutations()
+        logger.info("Mode %s: %d test cases to run", args.mode, num_mutations)
 
         monitors = []
         if not args.no_healthcheck:
@@ -158,8 +180,6 @@ def main():
             index_end=args.end_index,
         )
 
-        # Single boofuzz node for one-shot capsule fuzzing
-        msg = define_oneshot_capsule(session_name="wt_oneshot")
         session.connect(msg)
 
         try:

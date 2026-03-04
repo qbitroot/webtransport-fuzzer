@@ -215,7 +215,7 @@ def main():
                 hc_log_group_id = db._get_or_create_log_group(hc_session["lines"])
                 db.record_test_case(
                     index=tc["test_index"],
-                    sent_writes=[],
+                    sent_steps=[],
                     is_healthcheck=True,
                     lines=hc_session["lines"],
                 )

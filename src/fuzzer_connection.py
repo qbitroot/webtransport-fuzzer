@@ -155,6 +155,8 @@ class WebTransportConnection(ITargetConnection):
                 self._loop.run_until_complete(self._async_send_datagram(data))
             elif self._send_mode == "capsule":
                 self._loop.run_until_complete(self._async_send_capsule(data))
+            elif self._send_mode == "scenario":
+                self._loop.run_until_complete(self._async_run_scenario(data))
             else:  # Default: unidirectional
                 self._loop.run_until_complete(self._async_send_unidirectional(data))
             return target_len
@@ -186,6 +188,65 @@ class WebTransportConnection(ITargetConnection):
         if self._protocol._session_id is None:
             raise RuntimeError("Session not established for capsule")
         self._protocol.send_capsule(data)
+
+    async def _async_run_scenario(self, data: bytes):
+        """
+        Decode a scenario-encoded step list and execute each step in order.
+
+        Steps can be:
+          bidi     — send on bidirectional stream, await echo (with short timeout)
+          uni      — send on unidirectional stream (fire-and-forget)
+          datagram — send datagram
+          capsule  — send raw capsule bytes on CONNECT stream
+          sleep    — pause between steps
+        """
+        from src.sequence_mutator import decode_scenario, is_scenario_encoded
+
+        if not is_scenario_encoded(data):
+            # Fallback: treat as raw capsule blob
+            if self._protocol._session_id is not None:
+                self._protocol.send_capsule(data)
+            return
+
+        steps = decode_scenario(data)
+        for i, step in enumerate(steps):
+            action = step["action"]
+            logger.debug("Scenario step %d/%d: %s", i + 1, len(steps), action)
+
+            try:
+                if action == "bidi":
+                    # Send on bidi stream, try to get echo but don't fail on timeout
+                    try:
+                        _sid, _resp = await asyncio.wait_for(
+                            self._protocol.send_bidirectional_stream(
+                                step["data"], timeout=1.0
+                            ),
+                            timeout=1.5,
+                        )
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.debug("Bidi step %d: %s (continuing)", i, e)
+
+                elif action == "uni":
+                    await self._protocol.send_unidirectional_stream(step["data"])
+
+                elif action == "datagram":
+                    self._protocol.send_datagram(step["data"])
+
+                elif action == "capsule":
+                    self._protocol.send_capsule(step["data"])
+
+                elif action == "sleep":
+                    await asyncio.sleep(step.get("seconds", 0.05))
+
+                else:
+                    logger.warning("Unknown scenario step action: %s", action)
+
+            except Exception as e:
+                # Log but continue — we want to execute the full scenario
+                # even if the server resets mid-way (that's interesting behavior)
+                logger.debug(
+                    "Scenario step %d (%s) exception: %s (continuing)", i, action, e
+                )
 
     def recv(self, max_bytes: int) -> bytes:
         """

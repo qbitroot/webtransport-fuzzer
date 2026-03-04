@@ -230,3 +230,252 @@ def define_oneshot_capsule(session_name="wt_oneshot"):
     s_group(values=length_and_payload, name="LengthAndPayload")
 
     return s_get(session_name)
+
+
+# =============================================================================
+# Capsule Builder Helpers
+#
+# Build well-formed capsules for multistep sequence fuzzing.
+# Format: [Type (VarInt)][Length (VarInt)][Payload]
+# =============================================================================
+
+
+def build_close_session(error_code: int = 0, message: str = "") -> bytes:
+    """
+    Build a valid CLOSE_WEBTRANSPORT_SESSION capsule (0x2843).
+
+    Payload: [Application Error Code (32-bit BE)][Error Message (UTF-8, max 1024)]
+    """
+    msg_bytes = message.encode("utf-8")[:1024]
+    payload = struct.pack(">I", error_code) + msg_bytes
+    return CAPSULE_CLOSE_SESSION + encode_quic_varint(len(payload)) + payload
+
+
+def build_drain_session() -> bytes:
+    """
+    Build a valid DRAIN_WEBTRANSPORT_SESSION capsule (0x78AE).
+
+    Payload: empty (Length = 0).
+    """
+    return CAPSULE_DRAIN_SESSION + b"\x00"
+
+
+def build_max_data(limit: int) -> bytes:
+    """
+    Build a WT_MAX_DATA capsule (0x190B4D3D).
+
+    Payload: [Maximum Data (VarInt)]
+    """
+    payload = encode_quic_varint(limit)
+    return CAPSULE_MAX_DATA + encode_quic_varint(len(payload)) + payload
+
+
+def build_max_streams(limit: int, bidi: bool = True) -> bytes:
+    """
+    Build a WT_MAX_STREAMS capsule.
+
+    bidi=True  -> 0x190B4D3F (bidirectional)
+    bidi=False -> 0x190B4D40 (unidirectional)
+
+    Payload: [Maximum Streams (VarInt)]
+    """
+    capsule_type = CAPSULE_MAX_STREAMS_BIDI if bidi else CAPSULE_MAX_STREAMS_UNI
+    payload = encode_quic_varint(limit)
+    return capsule_type + encode_quic_varint(len(payload)) + payload
+
+
+def build_data_blocked(limit: int) -> bytes:
+    """
+    Build a WT_DATA_BLOCKED capsule (0x190B4D41).
+
+    Payload: [Maximum Data (VarInt)] — the limit at which blocking occurred.
+    """
+    payload = encode_quic_varint(limit)
+    return CAPSULE_DATA_BLOCKED + encode_quic_varint(len(payload)) + payload
+
+
+def build_streams_blocked(limit: int, bidi: bool = True) -> bytes:
+    """
+    Build a WT_STREAMS_BLOCKED capsule.
+
+    bidi=True  -> 0x190B4D43 (bidirectional)
+    bidi=False -> 0x190B4D44 (unidirectional)
+
+    Payload: [Maximum Streams (VarInt)] — the limit at which blocking occurred.
+    """
+    capsule_type = CAPSULE_STREAMS_BLOCKED_BIDI if bidi else CAPSULE_STREAMS_BLOCKED_UNI
+    payload = encode_quic_varint(limit)
+    return capsule_type + encode_quic_varint(len(payload)) + payload
+
+
+# =============================================================================
+# Multistep Scenarios
+#
+# Each scenario is a list of Steps (dicts with an "action" key).
+# Steps can be data operations (bidi, uni, datagram) or capsule injections.
+# The sequence_mutator generates permutations, duplications, omissions,
+# and injections — including post-CLOSE data activity.
+#
+# This is fundamentally different from oneshot: the server has real streams
+# and data in flight when capsules arrive, giving the fuzzer a much richer
+# attack surface (use-after-free, state confusion, etc.)
+# =============================================================================
+
+
+def _build_multistep_scenarios():
+    """
+    Build scenario dict. Deferred to a function so step_* helpers are available
+    at import time (they come from sequence_mutator).
+    """
+    from src.sequence_mutator import (
+        step_bidi,
+        step_uni,
+        step_datagram,
+        step_capsule,
+        step_sleep,
+    )
+
+    return {
+        # ---- Scenario 1: Bidi echo then graceful shutdown ----
+        # Establish real data flow, then tear down cleanly.
+        # Mutations: close before echo, drain mid-stream, double close, etc.
+        "bidi_then_shutdown": [
+            step_bidi(b"HELLO"),
+            step_capsule(build_drain_session()),
+            step_capsule(build_close_session(error_code=0)),
+        ],
+        # ---- Scenario 2: Multiple transports then close ----
+        # Exercise all three data paths, then close.
+        # Server has bidi, uni, and datagram state simultaneously.
+        "all_transports_then_close": [
+            step_bidi(b"BIDI_PAYLOAD"),
+            step_uni(b"UNI_PAYLOAD"),
+            step_datagram(b"DGRAM_PAYLOAD"),
+            step_capsule(build_close_session(error_code=0)),
+        ],
+        # ---- Scenario 3: Capsule between bidi streams ----
+        # Two bidi echo exchanges with a capsule in between.
+        # Tests: does a capsule disrupt ongoing stream processing?
+        "capsule_between_bidi": [
+            step_bidi(b"FIRST"),
+            step_capsule(build_max_data(65536)),
+            step_bidi(b"SECOND"),
+        ],
+        # ---- Scenario 4: Drain mid-conversation ----
+        # Send drain while data streams are active.
+        # Server should stay alive but prepare to shut down.
+        "drain_mid_data": [
+            step_bidi(b"BEFORE_DRAIN"),
+            step_capsule(build_drain_session()),
+            step_bidi(b"AFTER_DRAIN"),
+            step_uni(b"UNI_AFTER_DRAIN"),
+        ],
+        # ---- Scenario 5: Flow control with active streams ----
+        # Set flow limits while data is flowing.
+        # Tests: does MAX_DATA mid-stream confuse stream accounting?
+        "flow_with_streams": [
+            step_capsule(build_max_streams(10, bidi=True)),
+            step_capsule(build_max_streams(10, bidi=False)),
+            step_bidi(b"DATA_UNDER_LIMIT"),
+            step_capsule(build_max_data(65536)),
+            step_uni(b"MORE_DATA"),
+        ],
+        # ---- Scenario 6: Close with error after data ----
+        # Successful echo then abnormal close with error code + message.
+        # Tests: error code and UTF-8 message parsing after real activity.
+        "close_error_after_data": [
+            step_bidi(b"NORMAL_ECHO"),
+            step_datagram(b"NORMAL_DG"),
+            step_capsule(build_close_session(error_code=42, message="test error")),
+        ],
+        # ---- Scenario 7: Rapid bidi then close ----
+        # Burst of bidi streams followed by immediate close.
+        # Tests: does the server handle rapid stream creation before close?
+        "rapid_bidi_close": [
+            step_bidi(b"A"),
+            step_bidi(b"BB"),
+            step_bidi(b"CCC"),
+            step_capsule(build_close_session(error_code=0)),
+        ],
+        # ---- Scenario 8: Datagram flood then drain ----
+        # Multiple datagrams then a drain signal.
+        # Datagrams are unreliable; tests: drain during datagram processing.
+        "datagram_flood_drain": [
+            step_datagram(b"D1"),
+            step_datagram(b"D2"),
+            step_datagram(b"D3"),
+            step_capsule(build_drain_session()),
+        ],
+        # ---- Scenario 9: Interleaved uni + capsules ----
+        # Uni streams interleaved with flow control capsules.
+        # Tests: capsule processing doesn't block/corrupt uni stream handling.
+        "uni_capsule_interleave": [
+            step_uni(b"UNI_1"),
+            step_capsule(build_data_blocked(0)),
+            step_uni(b"UNI_2"),
+            step_capsule(build_max_data(4096)),
+            step_uni(b"UNI_3"),
+        ],
+        # ---- Scenario 10: Kitchen sink ----
+        # One of everything in a plausible order. Maximum permutation surface.
+        "kitchen_sink": [
+            step_capsule(build_max_streams(10, bidi=True)),
+            step_bidi(b"ECHO_ME"),
+            step_uni(b"FIRE_FORGET"),
+            step_datagram(b"UNRELIABLE"),
+            step_capsule(build_drain_session()),
+            step_capsule(build_close_session(error_code=0, message="done")),
+        ],
+        # ---- Scenario 11: Contradictory limits with data ----
+        # Set MAX_DATA to 0 (block everything), try data, then raise limit.
+        "contradictory_limits_with_data": [
+            step_capsule(build_max_data(0)),
+            step_bidi(b"SHOULD_THIS_WORK"),
+            step_capsule(build_max_data(65536)),
+            step_bidi(b"NOW_IT_SHOULD"),
+        ],
+        # ---- Scenario 12: Streams blocked signaling with data ----
+        # Report blocked, then try to create streams anyway.
+        "blocked_then_create": [
+            step_capsule(build_streams_blocked(0, bidi=True)),
+            step_bidi(b"BIDI_DESPITE_BLOCKED"),
+            step_capsule(build_streams_blocked(0, bidi=False)),
+            step_uni(b"UNI_DESPITE_BLOCKED"),
+        ],
+    }
+
+
+def define_multistep(session_name="wt_multistep"):
+    """
+    Multistep scenario fuzzer.
+
+    Pre-generates all step-sequence mutations from MULTISTEP_SCENARIOS,
+    encodes each as a binary scenario, and wraps them as a boofuzz s_group.
+
+    The connection decodes each scenario at send-time and executes the
+    steps (bidi, uni, datagram, capsule, sleep) in order.
+
+    Returns:
+        The boofuzz Request object.
+    """
+    from src.sequence_mutator import generate_sequence_mutations, encode_scenario
+
+    scenarios = _build_multistep_scenarios()
+    all_mutations = []
+
+    for _name, scenario in scenarios.items():
+        for mutation in generate_sequence_mutations(scenario):
+            all_mutations.append(encode_scenario(mutation))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for m in all_mutations:
+        if m not in seen:
+            seen.add(m)
+            unique.append(m)
+
+    s_initialize(session_name)
+    s_group(values=unique, name="ScenarioSequence")
+
+    return s_get(session_name)
