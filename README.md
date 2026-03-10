@@ -21,6 +21,12 @@ uv run python main.py --mode oneshot --url https://127.0.0.1:6161/echo
 # Multistep scenario fuzzer (interleaved data + capsule sequences)
 uv run python main.py --mode multistep --url https://127.0.0.1:6161/echo
 
+# Scenario-lastfuzz (scenarios in order, last step fuzzed like oneshot)
+uv run python main.py --mode scenario-lastfuzz --url https://127.0.0.1:6161/echo
+
+# All modes combined in a single run
+uv run python main.py --mode all --url https://127.0.0.1:6161/echo
+
 # With server subprocess management
 uv run python main.py --mode multistep --url https://127.0.0.1:6161/echo \
     --server-cmd "uv run server/aioquic/server.py cert.pem key.pem 2>&1 | tee server.log"
@@ -41,7 +47,19 @@ Sends a single malformed capsule per connection on the CONNECT stream (the WebTr
 
 Each test case is one `[CapsuleType][CapsuleLength][Payload]` blob. After sending, the health check (echo probe on a fresh bidirectional stream) verifies the server is still alive.
 
-**~12000 test cases.**
+### `--mode scenario-lastfuzz`
+
+Executes each scenario in its original step order (no permutations or mutations), but replaces the **last step** with a fuzzed malformed capsule — the same `[CapsuleType][CapsuleLength][Payload]` values used by oneshot mode.
+
+This combines the state-richness of multistep scenarios (the server has real streams and data in flight) with oneshot-style capsule coverage. Each test case plays the scenario's prefix steps as legitimate traffic to put the server into a specific state, then fires a single malformed capsule.
+
+Test cases = scenarios × oneshot fuzz values. Uses the same 12 scenarios as multistep and the same `ALL_INTERESTING_BYTES` pool as oneshot.
+
+### `--mode all`
+
+Runs all three modes (oneshot, multistep, scenario-lastfuzz) in a single unified session. Oneshot capsules are wrapped as single-step scenarios so the entire run uses the same executor. Test cases are deduplicated across modes.
+
+This is the "fire and forget" option for maximum coverage in one invocation.
 
 ### `--mode multistep`
 

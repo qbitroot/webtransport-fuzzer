@@ -445,6 +445,193 @@ def _build_multistep_scenarios():
     }
 
 
+def _build_lastfuzz_capsules() -> list:
+    """
+    Build a list of malformed capsule blobs for scenario-lastfuzz mode.
+
+    Mirrors the oneshot fuzzer's independent-axis strategy (not a full
+    cross-product) to keep the test count manageable:
+
+      Axis 1 — Fuzz capsule type, use a neutral length+payload:
+               [FuzzedType][0x00]  (length=0, no body)
+
+      Axis 2 — Fuzz length+payload, use a neutral capsule type:
+               [0x00][FuzzedLengthAndPayload]  (type=0, unknown → must be ignored)
+
+    Reuses ALL_INTERESTING_BYTES from the oneshot definition to stay DRY.
+    """
+    DEFAULT_LENGTH_PAYLOAD = b"\x00"  # VarInt length=0, empty body
+    DEFAULT_TYPE = b"\x00"  # Type 0 (unknown, must be ignored per RFC 9297)
+
+    blobs = []
+
+    # Axis 1: fuzz type, neutral length+payload
+    for capsule_type in ALL_INTERESTING_BYTES:
+        blobs.append(capsule_type + DEFAULT_LENGTH_PAYLOAD)
+
+    # Axis 2: fuzz length+payload, neutral type
+    # Without body: length is fuzzed, body is empty
+    for length_bytes in ALL_INTERESTING_BYTES:
+        blobs.append(DEFAULT_TYPE + length_bytes)
+    # With body: length is valid, body is an interesting payload
+    for payload_bytes in ALL_INTERESTING_BYTES:
+        valid_length = encode_quic_varint(len(payload_bytes))
+        blobs.append(DEFAULT_TYPE + valid_length + payload_bytes)
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for b in blobs:
+        if b not in seen:
+            seen.add(b)
+            unique.append(b)
+    return unique
+
+
+def define_scenario_lastfuzz(session_name="wt_scenario_lastfuzz"):
+    """
+    Scenario-lastfuzz mode: play each scenario in original order (no
+    permutations), but replace the last step with a malformed capsule.
+
+    This puts the server into a specific state via legitimate traffic
+    (bidi, uni, datagram, capsule steps) and then sends a single fuzzed
+    capsule — combining the state-richness of multistep scenarios with
+    the capsule-level coverage of oneshot mode.
+
+    Test cases = scenarios × fuzz blobs.
+
+    Returns:
+        The boofuzz Request object.
+    """
+    from src.sequence_mutator import step_capsule, encode_scenario
+
+    scenarios = _build_multistep_scenarios()
+    fuzz_blobs = _build_lastfuzz_capsules()
+
+    all_encoded = []
+    for _name, scenario in scenarios.items():
+        prefix = scenario[:-1] if len(scenario) > 1 else []
+        for blob in fuzz_blobs:
+            mutated = prefix + [step_capsule(blob)]
+            all_encoded.append(encode_scenario(mutated))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for m in all_encoded:
+        if m not in seen:
+            seen.add(m)
+            unique.append(m)
+
+    s_initialize(session_name)
+    s_group(values=unique, name="ScenarioLastFuzz")
+
+    return s_get(session_name)
+
+
+def _build_oneshot_as_scenarios() -> list:
+    """
+    Re-encode every oneshot capsule test case as a single-step scenario.
+
+    This allows oneshot blobs to be mixed into a unified s_group that
+    uses send_mode="scenario", keeping the 'all' mode executor uniform.
+
+    Mirrors define_oneshot_capsule() exactly: the two s_group axes are
+    iterated in lockstep with each axis held at its default while the
+    other varies, and the compound blob [type + length_and_payload] is
+    what gets sent.
+
+      Axis 1 — type varies, LengthAndPayload fixed at default (first value):
+                [FuzzedType][DefaultLAP]
+
+      Axis 2 — type fixed at default (first value), LengthAndPayload varies:
+                [DefaultType][FuzzedLAP]
+
+    The seed case (both defaults) is included as well.
+    """
+    from src.sequence_mutator import step_capsule, encode_scenario
+
+    # Build the LengthAndPayload list exactly as define_oneshot_capsule does
+    length_and_payload = []
+    for length_bytes in ALL_INTERESTING_BYTES:
+        length_and_payload.append(length_bytes + b"")
+    for payload_bytes in ALL_INTERESTING_BYTES:
+        valid_length = encode_quic_varint(len(payload_bytes))
+        length_and_payload.append(valid_length + payload_bytes)
+    unique_lap = list(dict.fromkeys(length_and_payload))
+
+    default_type = ALL_INTERESTING_BYTES[0]
+    default_lap = unique_lap[0]
+
+    blobs = []
+    # Seed: both axes at default
+    blobs.append(default_type + default_lap)
+    # Axis 1: type varies, LAP held at default
+    for capsule_type in ALL_INTERESTING_BYTES[1:]:
+        blobs.append(capsule_type + default_lap)
+    # Axis 2: LAP varies, type held at default
+    for lap in unique_lap[1:]:
+        blobs.append(default_type + lap)
+
+    # Deduplicate while preserving order, then wrap each as a 1-step scenario
+    seen = set()
+    unique = []
+    for b in blobs:
+        if b not in seen:
+            seen.add(b)
+            unique.append(encode_scenario([step_capsule(b)]))
+    return unique
+
+
+def define_all(session_name="wt_all"):
+    """
+    Combined mode: concatenates test cases from all three modes into a
+    single boofuzz s_group.
+
+    Order: oneshot (as scenarios) → multistep → scenario-lastfuzz.
+
+    Everything uses the scenario encoding so the connection executor
+    (send_mode="scenario") handles all cases uniformly.
+
+    Returns:
+        The boofuzz Request object.
+    """
+    from src.sequence_mutator import generate_sequence_mutations, encode_scenario
+
+    all_values = []
+
+    # 1. Oneshot capsules wrapped as single-step scenarios
+    all_values.extend(_build_oneshot_as_scenarios())
+
+    # 2. Multistep mutations
+    scenarios = _build_multistep_scenarios()
+    for _name, scenario in scenarios.items():
+        for mutation in generate_sequence_mutations(scenario):
+            all_values.append(encode_scenario(mutation))
+
+    # 3. Scenario-lastfuzz
+    from src.sequence_mutator import step_capsule
+
+    fuzz_blobs = _build_lastfuzz_capsules()
+    for _name, scenario in scenarios.items():
+        prefix = scenario[:-1] if len(scenario) > 1 else []
+        for blob in fuzz_blobs:
+            all_values.append(encode_scenario(prefix + [step_capsule(blob)]))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for m in all_values:
+        if m not in seen:
+            seen.add(m)
+            unique.append(m)
+
+    s_initialize(session_name)
+    s_group(values=unique, name="AllModes")
+
+    return s_get(session_name)
+
+
 def define_multistep(session_name="wt_multistep"):
     """
     Multistep scenario fuzzer.

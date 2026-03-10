@@ -10,7 +10,12 @@ from boofuzz import Session, Target
 
 from src.fuzzer_connection import WebTransportConnection
 from src.echo_monitor import EchoCompareMonitor, ServerDownError
-from src.boofuzz_definitions import define_oneshot_capsule, define_multistep
+from src.boofuzz_definitions import (
+    define_oneshot_capsule,
+    define_multistep,
+    define_scenario_lastfuzz,
+    define_all,
+)
 
 # ---- Logging setup ----
 LOG_FMT = "%(asctime)s [%(levelname)5s] %(name)s: %(message)s"
@@ -33,10 +38,13 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["oneshot", "multistep"],
+        choices=["oneshot", "multistep", "scenario-lastfuzz", "all"],
         default="oneshot",
         help="Fuzzing mode: oneshot (single malformed capsule), "
-        "multistep (scenarios with interleaved data streams + capsules) "
+        "multistep (scenarios with interleaved data streams + capsules), "
+        "scenario-lastfuzz (scenarios in original order, last step replaced "
+        "with fuzzed capsule), "
+        "all (oneshot + multistep + scenario-lastfuzz combined) "
         "(default: oneshot)",
     )
     parser.add_argument(
@@ -80,6 +88,8 @@ def main():
     mode_desc = {
         "oneshot": "One-Shot (single malformed capsule per connection)",
         "multistep": "Multistep (data streams + capsule sequences)",
+        "scenario-lastfuzz": "Scenario-LastFuzz (scenario + fuzzed last step)",
+        "all": "All modes combined (oneshot + multistep + lastfuzz)",
     }
 
     print(
@@ -149,6 +159,12 @@ def main():
         elif args.mode == "multistep":
             send_mode = "scenario"
             msg = define_multistep(session_name="wt_multistep")
+        elif args.mode == "scenario-lastfuzz":
+            send_mode = "scenario"
+            msg = define_scenario_lastfuzz(session_name="wt_scenario_lastfuzz")
+        elif args.mode == "all":
+            send_mode = "scenario"
+            msg = define_all(session_name="wt_all")
         else:
             logger.error("Unknown mode: %s", args.mode)
             sys.exit(1)
