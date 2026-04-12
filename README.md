@@ -6,6 +6,7 @@ Targets the capsule layer on the CONNECT stream and data transports (bidirection
 
 - **`server/aioquic`** — Python echo server using [aioquic](https://github.com/aiortc/aioquic) (draft-03 / GEN1)
 - **`server/wtransport`** — Rust echo server using [wtransport](https://github.com/BiagioFesta/wtransport) (draft-09 / GEN3)
+- **`server/webtransport-go`** — Go echo server using [webtransport-go](https://github.com/quic-go/webtransport-go) (HTTP/3 over QUIC, self-signed TLS, listens on `0.0.0.0:6161`)
 
 ---
 
@@ -186,6 +187,8 @@ uv run analyze_logs.py --log server.log --db boofuzz-results/run_<timestamp>.db
 
 Standard logging (warnings, stack traces) goes to **stderr** and is not captured by the pipeline. Any server line not starting with `WTFUZZ|` is flagged as `[SERVER RAW]` — these typically indicate panics or assertion failures.
 
+> **Note (webtransport-go):** The `webtransport-go` library does not expose the underlying QUIC stream ID through its API, so `RECV_BIDI`, `RECV_UNI`, and `ECHO` events from `server/webtransport-go` omit the `stream_id` field. This is a library limitation and does not affect fuzzing coverage.
+
 ### Adding a new server
 
 1. Maintain a global connection counter (starting at 0).
@@ -213,6 +216,7 @@ get-server-version.py     — server draft-version fingerprinting tool
 server/
   aioquic/                — Python echo server (draft-03)
   wtransport/             — Rust echo server (draft-09)
+  webtransport-go/        — Go echo server (webtransport-go / HTTP3+QUIC)
 ```
 
 ---
