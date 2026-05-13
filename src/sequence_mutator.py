@@ -10,12 +10,13 @@ permutations, duplications, omissions, rapid-fire bursts, reversal, and
 prohibited-capsule injections. All operators preserve action types so the
 connection knows how to execute each step.
 
-For boofuzz transport, scenarios are not encoded into bytes directly.
-Instead, ``ScenarioRegistry`` assigns each unique scenario a sequential
-integer id, and the bytes value handed to ``s_group`` is a fixed-width
-8-byte token of the form ``b"WTSC" + id (BE u32)``. The connection
-decodes the token and looks up the scenario by id at send time. This
-avoids JSON-in-bytes encoding entirely.
+For boofuzz transport, scenarios cannot be passed as Python objects through
+``s_group`` (which only accepts ``bytes``). Instead, ``ScenarioRegistry``
+assigns each unique scenario a sequential integer id and stores a bare
+4-byte big-endian uint32 in ``s_group``. The connection is always in
+either capsule or scenario send mode (never both), so ``send_mode`` alone
+is the dispatch discriminator — no magic prefix is needed to distinguish
+scenario tokens from capsule blobs.
 """
 
 from __future__ import annotations
@@ -180,9 +181,6 @@ def generate_sequence_mutations(scenario: Scenario) -> List[Scenario]:
 
 # ---- Scenario registry: bytes-token <-> Scenario lookup for boofuzz s_group ----
 
-_SCENARIO_MAGIC = b"WTSC"
-_SCENARIO_TOKEN_LEN = len(_SCENARIO_MAGIC) + 4  # magic + uint32 BE
-
 
 class ScenarioRegistry:
     """
@@ -202,20 +200,20 @@ class ScenarioRegistry:
         return len(self._scenarios)
 
     def register(self, scenario: Scenario) -> bytes:
-        """Return the token for ``scenario``, registering it if new."""
+        """Return the 4-byte token for ``scenario``, registering it if new."""
         scenario = tuple(scenario)
         idx = self._index.get(scenario)
         if idx is None:
             idx = len(self._scenarios)
             self._scenarios.append(scenario)
             self._index[scenario] = idx
-        return _SCENARIO_MAGIC + struct.pack(">I", idx)
+        return struct.pack(">I", idx)
 
     def lookup(self, token: bytes) -> Scenario:
-        """Decode a token back into the registered scenario."""
-        if not is_scenario_token(token):
-            raise ValueError("Not a scenario token")
-        (idx,) = struct.unpack(">I", token[len(_SCENARIO_MAGIC) :])
+        """Decode a 4-byte token back into the registered scenario."""
+        if len(token) != 4:
+            raise ValueError(f"Expected 4-byte scenario token, got {len(token)} bytes")
+        (idx,) = struct.unpack(">I", token)
         try:
             return self._scenarios[idx]
         except IndexError:
@@ -229,8 +227,3 @@ class ScenarioRegistry:
 
 # Process-wide registry shared by definitions (writers) and the connection (reader).
 SCENARIOS = ScenarioRegistry()
-
-
-def is_scenario_token(data: bytes) -> bool:
-    """True if ``data`` is a fixed-width scenario token."""
-    return len(data) == _SCENARIO_TOKEN_LEN and data.startswith(_SCENARIO_MAGIC)

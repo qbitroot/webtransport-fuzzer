@@ -38,7 +38,6 @@ from boofuzz.connections import ITargetConnection
 from src.sequence_mutator import (
     SCENARIOS,
     Step,
-    is_scenario_token,
     step_capsule,
 )
 from src.webtransport_client import WebTransportClient
@@ -274,8 +273,10 @@ class WebTransportConnection(ITargetConnection):
 
     async def _run_scenario(self, token: bytes) -> _SendResult:
         """Scenario mode: decode token, execute steps, collect outcomes."""
-        if not is_scenario_token(token):
-            raise RuntimeError("scenario send_mode received non-scenario bytes")
+        if len(token) != 4:
+            raise RuntimeError(
+                f"scenario send_mode expected 4-byte index token, got {len(token)} bytes"
+            )
 
         scenario = SCENARIOS.lookup(token)
         result = _SendResult()
