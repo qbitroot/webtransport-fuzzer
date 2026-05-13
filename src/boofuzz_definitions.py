@@ -496,28 +496,25 @@ def build_streams_blocked(limit: int, bidi: bool = True) -> bytes:
 # =============================================================================
 # Multistep Scenarios
 #
-# Each scenario is a list of Steps (dicts with an "action" key).
-# Steps can be data operations (bidi, uni, datagram) or capsule injections.
+# Each scenario is a list of Step instances (see src.sequence_mutator).
+# Steps cover the four WebTransport actions: bidi, uni, datagram, capsule.
 # The sequence_mutator generates permutations, duplications, omissions,
-# and injections — including post-CLOSE data activity.
+# rapid-fire bursts, reversal, and prohibited-capsule injections —
+# including post-CLOSE data activity.
 #
-# This is fundamentally different from oneshot: the server has real streams
-# and data in flight when capsules arrive, giving the fuzzer a much richer
-# attack surface (use-after-free, state confusion, etc.)
+# Multistep is fundamentally different from oneshot: the server has real
+# streams and data in flight when fuzzed capsules arrive, giving the
+# fuzzer a much richer attack surface (use-after-free, state confusion).
 # =============================================================================
 
 
 def _build_multistep_scenarios():
-    """
-    Build scenario dict. Deferred to a function so step_* helpers are available
-    at import time (they come from sequence_mutator).
-    """
+    """Build the named-scenario dict (deferred to keep import order simple)."""
     from src.sequence_mutator import (
         step_bidi,
         step_uni,
         step_datagram,
         step_capsule,
-        step_sleep,
     )
 
     return {
@@ -659,113 +656,97 @@ def _build_lastfuzz_capsules() -> list:
     return list(dict.fromkeys(blobs))
 
 
+def _multistep_mutations() -> list:
+    """All scenario mutations across all named scenarios, deduplicated."""
+    from src.sequence_mutator import generate_sequence_mutations
+
+    seen: set = set()
+    out: list = []
+    for scenario in _build_multistep_scenarios().values():
+        for mutation in generate_sequence_mutations(scenario):
+            if mutation not in seen:
+                seen.add(mutation)
+                out.append(mutation)
+    return out
+
+
+def _lastfuzz_scenarios() -> list:
+    """
+    Each named scenario, in original order, with its last step replaced
+    by every malformed capsule from ``_build_lastfuzz_capsules``.
+    """
+    from src.sequence_mutator import step_capsule
+
+    fuzz_blobs = _build_lastfuzz_capsules()
+    seen: set = set()
+    out: list = []
+    for scenario in _build_multistep_scenarios().values():
+        prefix = tuple(scenario[:-1]) if len(scenario) > 1 else ()
+        for blob in fuzz_blobs:
+            mutation = prefix + (step_capsule(blob),)
+            if mutation not in seen:
+                seen.add(mutation)
+                out.append(mutation)
+    return out
+
+
+def _oneshot_as_scenarios() -> list:
+    """
+    Wrap every oneshot capsule blob as a single-step scenario, sharing
+    the same Tier-A + Tier-B corpus as ``define_oneshot_capsule``.
+    """
+    from src.sequence_mutator import step_capsule
+
+    blobs = list(dict.fromkeys(_build_tier_a_blobs() + _build_raw_fuzz_blobs()))
+    return [(step_capsule(b),) for b in blobs]
+
+
+def _register_scenarios(scenarios: list) -> list:
+    """Register scenarios with the global registry; return their tokens."""
+    from src.sequence_mutator import SCENARIOS
+
+    return [SCENARIOS.register(s) for s in scenarios]
+
+
 def define_scenario_lastfuzz(session_name="wt_scenario_lastfuzz"):
     """
     Scenario-lastfuzz mode: play each scenario in original order (no
     permutations), but replace the last step with a malformed capsule.
 
-    This puts the server into a specific state via legitimate traffic
-    (bidi, uni, datagram, capsule steps) and then sends a single fuzzed
-    capsule — combining the state-richness of multistep scenarios with
-    the capsule-level coverage of oneshot mode.
+    Combines the state-richness of multistep scenarios (server has real
+    streams in flight) with the capsule-level coverage of oneshot.
 
-    Test cases = scenarios × fuzz blobs.
-
-    Returns:
-        The boofuzz Request object.
+    Test cases = scenarios × fuzz blobs (deduplicated).
     """
-    from src.sequence_mutator import step_capsule, encode_scenario
-
-    scenarios = _build_multistep_scenarios()
-    fuzz_blobs = _build_lastfuzz_capsules()
-
-    all_encoded = []
-    for _name, scenario in scenarios.items():
-        prefix = scenario[:-1] if len(scenario) > 1 else []
-        for blob in fuzz_blobs:
-            all_encoded.append(encode_scenario(prefix + [step_capsule(blob)]))
-
+    tokens = _register_scenarios(_lastfuzz_scenarios())
+    _reset_request(session_name)
     s_initialize(session_name)
-    s_group(values=list(dict.fromkeys(all_encoded)), name="ScenarioLastFuzz")
+    s_group(values=list(dict.fromkeys(tokens)), name="ScenarioLastFuzz")
     return s_get(session_name)
-
-
-def _build_oneshot_as_scenarios() -> list:
-    """
-    Re-encode every oneshot capsule blob as a single-step scenario so it
-    can share the scenario-encoded ``s_group`` used by ``define_all``.
-
-    The blob set is exactly the union ``define_oneshot_capsule`` builds
-    (Tier A + Tier B), keeping a single source of truth for the oneshot
-    corpus.
-    """
-    from src.sequence_mutator import step_capsule, encode_scenario
-
-    blobs = list(dict.fromkeys(_build_tier_a_blobs() + _build_raw_fuzz_blobs()))
-    return [encode_scenario([step_capsule(b)]) for b in blobs]
 
 
 def define_all(session_name="wt_all"):
     """
-    Combined mode: concatenates test cases from all three modes into a
-    single boofuzz s_group.
+    Combined mode: oneshot (as 1-step scenarios) + multistep + scenario-lastfuzz
+    in a single boofuzz s_group, all executed via the same scenario path.
 
-    Order: oneshot (as scenarios) → multistep → scenario-lastfuzz.
-
-    Everything uses the scenario encoding so the connection executor
-    (send_mode="scenario") handles all cases uniformly.
-
-    Returns:
-        The boofuzz Request object.
+    Test cases are deduplicated across modes.
     """
-    from src.sequence_mutator import generate_sequence_mutations, encode_scenario
-
-    all_values = []
-
-    # 1. Oneshot capsules wrapped as single-step scenarios
-    all_values.extend(_build_oneshot_as_scenarios())
-
-    # 2. Multistep mutations
-    scenarios = _build_multistep_scenarios()
-    for _name, scenario in scenarios.items():
-        for mutation in generate_sequence_mutations(scenario):
-            all_values.append(encode_scenario(mutation))
-
-    # 3. Scenario-lastfuzz
-    from src.sequence_mutator import step_capsule
-
-    fuzz_blobs = _build_lastfuzz_capsules()
-    for _name, scenario in scenarios.items():
-        prefix = scenario[:-1] if len(scenario) > 1 else []
-        for blob in fuzz_blobs:
-            all_values.append(encode_scenario(prefix + [step_capsule(blob)]))
-
+    scenarios = _oneshot_as_scenarios() + _multistep_mutations() + _lastfuzz_scenarios()
+    tokens = _register_scenarios(scenarios)
+    _reset_request(session_name)
     s_initialize(session_name)
-    s_group(values=list(dict.fromkeys(all_values)), name="AllModes")
+    s_group(values=list(dict.fromkeys(tokens)), name="AllModes")
     return s_get(session_name)
 
 
 def define_multistep(session_name="wt_multistep"):
     """
-    Multistep scenario fuzzer.
-
-    Pre-generates all step-sequence mutations from MULTISTEP_SCENARIOS,
-    encodes each as a binary scenario, and wraps them as a boofuzz s_group.
-
-    The connection decodes each scenario at send-time and executes the
-    steps (bidi, uni, datagram, capsule, sleep) in order.
-
-    Returns:
-        The boofuzz Request object.
+    Multistep scenario fuzzer: every mutation of every named scenario,
+    executed step-by-step on a single live WebTransport session.
     """
-    from src.sequence_mutator import generate_sequence_mutations, encode_scenario
-
-    scenarios = _build_multistep_scenarios()
-    all_mutations = []
-    for _name, scenario in scenarios.items():
-        for mutation in generate_sequence_mutations(scenario):
-            all_mutations.append(encode_scenario(mutation))
-
+    tokens = _register_scenarios(_multistep_mutations())
+    _reset_request(session_name)
     s_initialize(session_name)
-    s_group(values=list(dict.fromkeys(all_mutations)), name="ScenarioSequence")
+    s_group(values=list(dict.fromkeys(tokens)), name="ScenarioSequence")
     return s_get(session_name)

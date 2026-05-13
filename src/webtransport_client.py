@@ -1,19 +1,33 @@
 """
-WebTransport client wrapper for aioquic.
-Provides a reusable WebTransport client implementation.
+aioquic-based WebTransport client used by the fuzzer.
+
+A single ``WebTransportClient`` instance owns one QUIC connection, one
+HTTP/3 connection, and one WebTransport session (CONNECT stream). It
+exposes the four data-plane primitives the fuzzer needs:
+
+* ``send_bidirectional_stream`` — open a bidi stream, send, await echo.
+* ``send_unidirectional_stream`` — open a uni stream, send.
+* ``send_datagram``               — send a QUIC datagram.
+* ``send_capsule``                — write a raw capsule on the CONNECT stream.
+
+For server-echoed data plane primitives (uni, datagram), the matching
+``receive_*_echo`` helpers wait for the next message of that type on the
+shared queue.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional, Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h3.connection import H3Connection
 from aioquic.h3.events import (
     DatagramReceived,
     HeadersReceived,
-    WebTransportStreamDataReceived,
     H3Event,
+    WebTransportStreamDataReceived,
 )
 from aioquic.quic.events import QuicEvent, StreamDataReceived
 
@@ -21,36 +35,33 @@ logger = logging.getLogger(__name__)
 
 
 class WebTransportClient(QuicConnectionProtocol):
-    """
-    WebTransport client protocol handler.
-    Manages WebTransport session over HTTP/3.
-    """
+    """WebTransport-over-HTTP/3 client protocol handler."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._http: Optional[H3Connection] = None
         self._session_id: Optional[int] = None
         self._session_established = asyncio.Event()
-        self._received_messages = asyncio.Queue()
         self._authority: Optional[str] = None
-        self._bidirectional_streams: Dict[int, asyncio.Queue] = {}
+
+        # Per-stream response queues for tracked bidirectional streams.
+        self._bidi_response_queues: Dict[int, asyncio.Queue] = {}
+
+        # Server-pushed data not tied to a tracked bidi stream:
+        #   - WebTransportStreamDataReceived from server-opened uni streams
+        #   - DatagramReceived
+        # Tuples on the queue: ("stream", stream_id, data) | ("datagram", data).
+        self._inbound: asyncio.Queue = asyncio.Queue()
+
+    # -- aioquic event handlers ----------------------------------------------------
 
     def quic_event_received(self, event: QuicEvent):
-        """Handle QUIC events and pass them to H3Connection."""
         if isinstance(event, StreamDataReceived):
-            if event.stream_id in self._bidirectional_streams:
-                logger.debug(
-                    "Received data on tracked bidirectional stream %d", event.stream_id
-                )
-                self._bidirectional_streams[event.stream_id].put_nowait(
-                    ("data", event.data)
-                )
-
+            queue = self._bidi_response_queues.get(event.stream_id)
+            if queue is not None:
+                queue.put_nowait(("data", event.data))
                 if event.end_stream:
-                    logger.debug("Stream %d closed by server", event.stream_id)
-                    self._bidirectional_streams[event.stream_id].put_nowait(
-                        ("end", None)
-                    )
+                    queue.put_nowait(("end", None))
 
         if self._http is None:
             self._http = H3Connection(self._quic, enable_webtransport=True)
@@ -59,11 +70,8 @@ class WebTransportClient(QuicConnectionProtocol):
             self._handle_h3_event(h3_event)
 
     def _handle_h3_event(self, event: H3Event):
-        """Handle HTTP/3 events."""
         if isinstance(event, HeadersReceived):
-            headers_dict = dict(event.headers)
-            status = headers_dict.get(b":status", b"")
-
+            status = dict(event.headers).get(b":status", b"")
             if status == b"200":
                 logger.info(
                     "WebTransport session established (stream %d)", event.stream_id
@@ -71,31 +79,19 @@ class WebTransportClient(QuicConnectionProtocol):
                 self._session_id = event.stream_id
                 self._session_established.set()
             else:
-                logger.error(
-                    "WebTransport session failed with status: %s", status.decode()
-                )
-                logger.error("Headers: %s", headers_dict)
+                logger.error("WebTransport session failed; status=%s", status.decode())
 
         elif isinstance(event, DatagramReceived):
-            message = event.data
-            logger.debug("Datagram received: %d bytes", len(message))
-            self._received_messages.put_nowait(("datagram", message))
+            self._inbound.put_nowait(("datagram", event.data))
 
         elif isinstance(event, WebTransportStreamDataReceived):
-            logger.debug(
-                "Stream data received (stream %d): %d bytes",
-                event.stream_id,
-                len(event.data),
-            )
-            self._received_messages.put_nowait(("stream", event.stream_id, event.data))
+            self._inbound.put_nowait(("stream", event.stream_id, event.data))
 
-            if event.stream_ended:
-                logger.debug("Stream %d closed by server", event.stream_id)
+    # -- session establishment -----------------------------------------------------
 
     async def establish_session(self, authority: str, path: str = "/echo"):
-        """Establish a WebTransport session."""
+        """Send the WebTransport CONNECT request and wait for the 200 response."""
         self._authority = authority
-
         stream_id = self._quic.get_next_available_stream_id()
 
         headers = [
@@ -105,7 +101,6 @@ class WebTransportClient(QuicConnectionProtocol):
             (b":path", path.encode()),
             (b":protocol", b"webtransport"),
         ]
-
         logger.info("Establishing WebTransport session to %s%s", authority, path)
         self._http.send_headers(stream_id, headers)
         self.transmit()
@@ -113,154 +108,12 @@ class WebTransportClient(QuicConnectionProtocol):
         await asyncio.wait_for(self._session_established.wait(), timeout=5.0)
         logger.info("WebTransport session ready")
 
-    def send_datagram(self, data: bytes):
-        """Send a datagram over WebTransport."""
-        if self._session_id is None:
-            raise RuntimeError("WebTransport session not established")
-
-        self._http.send_datagram(stream_id=self._session_id, data=data)
-        self.transmit()
-        logger.debug("Sent datagram: %d bytes", len(data))
-
-    async def send_unidirectional_stream(self, data: bytes):
-        """Send data on a unidirectional WebTransport stream."""
-        if self._session_id is None:
-            raise RuntimeError("WebTransport session not established")
-
-        stream_id = self._http.create_webtransport_stream(
-            session_id=self._session_id, is_unidirectional=True
-        )
-
-        self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=True)
-        self.transmit()
-        logger.debug(
-            "Sent unidirectional stream (stream %d): %d bytes", stream_id, len(data)
-        )
-
-    async def send_bidirectional_stream(
-        self, data: bytes, timeout: float = 5.0
-    ) -> Tuple[int, Optional[bytes]]:
-        """Send data on a bidirectional WebTransport stream and wait for response."""
-        if self._session_id is None:
-            raise RuntimeError("WebTransport session not established")
-
-        stream_id = self._http.create_webtransport_stream(
-            session_id=self._session_id, is_unidirectional=False
-        )
-
-        response_queue = asyncio.Queue()
-        self._bidirectional_streams[stream_id] = response_queue
-
-        logger.debug(
-            "Opened bidirectional stream #%d with %d bytes", stream_id, len(data)
-        )
-
-        try:
-            self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=True)
-            self.transmit()
-
-            event_type, response = await asyncio.wait_for(
-                response_queue.get(), timeout=timeout
-            )
-
-            if event_type == "data" and response:
-                logger.debug(
-                    "Bidirectional stream %d response received: %d bytes",
-                    stream_id,
-                    len(response),
-                )
-
-                try:
-                    end_event = await asyncio.wait_for(
-                        response_queue.get(), timeout=1.0
-                    )
-                    if end_event[0] == "end":
-                        logger.debug("Bidirectional stream %d ended", stream_id)
-                except asyncio.TimeoutError:
-                    logger.debug("No explicit end event for stream %d", stream_id)
-
-                return stream_id, response
-            elif event_type == "end":
-                logger.debug(
-                    "Bidirectional stream %d completed (stream ended without data)",
-                    stream_id,
-                )
-                return stream_id, None
-            else:
-                logger.warning("Unexpected event on bidirectional stream %d", stream_id)
-                return stream_id, None
-
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Timeout waiting for response on bidirectional stream %d", stream_id
-            )
-            return stream_id, None
-        finally:
-            if stream_id in self._bidirectional_streams:
-                del self._bidirectional_streams[stream_id]
-
-    def create_raw_stream(self, is_unidirectional: bool = True) -> int:
-        """
-        Create a QUIC stream ID without H3/WebTransport tracking.
-        Used for fuzzing to inject raw frames.
-        """
-        return self._quic.get_next_available_stream_id(
-            is_unidirectional=is_unidirectional
-        )
-
-    def send_raw_stream(self, stream_id: int, data: bytes, end_stream: bool = False):
-        """
-        Send raw bytes on a QUIC stream, bypassing H3 framing.
-        """
-        self._quic.send_stream_data(
-            stream_id=stream_id, data=data, end_stream=end_stream
-        )
-        self.transmit()
-        logger.debug("Sent raw stream (stream %d): %d bytes", stream_id, len(data))
-
-    async def receive_datagram(self, timeout: float = 5.0) -> Optional[bytes]:
-        """Wait for an echoed datagram from the server."""
-        try:
-            while True:
-                msg = await asyncio.wait_for(
-                    self._received_messages.get(), timeout=timeout
-                )
-                if msg[0] == "datagram":
-                    return msg[1]
-                # Re-queue non-datagram messages
-                self._received_messages.put_nowait(msg)
-        except asyncio.TimeoutError:
-            logger.warning("Timeout waiting for datagram response")
-            return None
-
-    async def receive_stream_data(
-        self, timeout: float = 5.0
-    ) -> Optional[Tuple[int, bytes]]:
-        """Wait for echoed stream data (e.g. uni stream echo) from the server.
-        Returns (stream_id, data) or None on timeout."""
-        try:
-            while True:
-                msg = await asyncio.wait_for(
-                    self._received_messages.get(), timeout=timeout
-                )
-                if msg[0] == "stream":
-                    return (msg[1], msg[2])
-                # Re-queue non-stream messages
-                self._received_messages.put_nowait(msg)
-        except asyncio.TimeoutError:
-            logger.warning("Timeout waiting for stream response")
-            return None
+    # -- send primitives -----------------------------------------------------------
 
     def send_capsule(self, data: bytes):
-        """
-        Send raw capsule data on the CONNECT stream (session control).
-        Capsules are sent on the same stream as the CONNECT request.
-        Format: [Type (VarInt)][Length (VarInt)][Payload]
-        """
+        """Write raw capsule bytes on the CONNECT (session control) stream."""
         if self._session_id is None:
             raise RuntimeError("WebTransport session not established")
-
-        # Send on the CONNECT stream (session_id is the CONNECT stream ID)
         self._quic.send_stream_data(
             stream_id=self._session_id, data=data, end_stream=False
         )
@@ -268,3 +121,82 @@ class WebTransportClient(QuicConnectionProtocol):
         logger.debug(
             "Sent capsule on CONNECT stream %d: %d bytes", self._session_id, len(data)
         )
+
+    def send_datagram(self, data: bytes):
+        """Send a QUIC datagram on the WebTransport session."""
+        if self._session_id is None:
+            raise RuntimeError("WebTransport session not established")
+        self._http.send_datagram(stream_id=self._session_id, data=data)
+        self.transmit()
+        logger.debug("Sent datagram: %d bytes", len(data))
+
+    async def send_unidirectional_stream(self, data: bytes) -> int:
+        """Open a uni WebTransport stream, send ``data``, return the stream id."""
+        if self._session_id is None:
+            raise RuntimeError("WebTransport session not established")
+        stream_id = self._http.create_webtransport_stream(
+            session_id=self._session_id, is_unidirectional=True
+        )
+        self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=True)
+        self.transmit()
+        logger.debug("Sent uni stream %d: %d bytes", stream_id, len(data))
+        return stream_id
+
+    async def send_bidirectional_stream(
+        self, data: bytes, timeout: float = 5.0
+    ) -> Tuple[int, Optional[bytes]]:
+        """
+        Open a bidi WebTransport stream, send ``data``, wait for the echo.
+
+        Returns ``(stream_id, response_or_None)``. ``None`` on timeout or
+        if the server closes the stream without sending data.
+        """
+        if self._session_id is None:
+            raise RuntimeError("WebTransport session not established")
+        stream_id = self._http.create_webtransport_stream(
+            session_id=self._session_id, is_unidirectional=False
+        )
+        queue: asyncio.Queue = asyncio.Queue()
+        self._bidi_response_queues[stream_id] = queue
+        try:
+            self._quic.send_stream_data(stream_id=stream_id, data=data, end_stream=True)
+            self.transmit()
+            try:
+                event_type, payload = await asyncio.wait_for(
+                    queue.get(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                logger.debug("Bidi stream %d: timeout waiting for echo", stream_id)
+                return stream_id, None
+            if event_type == "data":
+                # Drain the trailing "end" event if it arrives soon.
+                try:
+                    await asyncio.wait_for(queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+                return stream_id, payload
+            return stream_id, None
+        finally:
+            self._bidi_response_queues.pop(stream_id, None)
+
+    # -- echo receive helpers (for uni / datagram steps) ---------------------------
+
+    async def receive_stream_echo(self, timeout: float = 1.0) -> Optional[bytes]:
+        """Return the next server-pushed stream payload, or ``None`` on timeout."""
+        return await self._next_inbound("stream", timeout)
+
+    async def receive_datagram_echo(self, timeout: float = 1.0) -> Optional[bytes]:
+        """Return the next server-pushed datagram, or ``None`` on timeout."""
+        return await self._next_inbound("datagram", timeout)
+
+    async def _next_inbound(self, kind: str, timeout: float) -> Optional[bytes]:
+        try:
+            msg = await asyncio.wait_for(self._inbound.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        if msg[0] != kind:
+            # Wrong kind — push it back so the right consumer can pick it up.
+            self._inbound.put_nowait(msg)
+            return None
+        # ("stream", stream_id, data) or ("datagram", data)
+        return msg[-1]

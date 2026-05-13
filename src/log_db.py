@@ -1,26 +1,26 @@
 """
-SQLite database for storing server logs correlated with fuzzer test cases.
+SQLite store for fuzzer test cases and the server output they produced.
 
-Normalized model: (request_bytes ↔ response_category).
+Two tables:
 
-Log output is deduplicated into `log_groups` — each unique combination of
-server output lines is stored once. Multiple test cases that produce the
-same output all point to the same log_group_id, making it trivial to
-group by failure mode.
+* ``test_cases`` — one row per fuzz test case, with ``sent_data`` as
+  newline-separated ``action(hex)`` lines (one per executed step).
+* ``log_groups`` — unique server-output blocks, deduplicated by SHA-256
+  of the joined log lines. ``test_cases.log_group_id`` is filled in
+  offline by ``analyze_logs.py`` once the server log is available.
 
-No parsing or validation is performed on the server output. The WTFUZZ
-structured log format (``WTFUZZ|<conn_idx>|EVENT|k=v|...``) is already
-self-describing, so lines are stored verbatim. If the server emits
-unexpected output (panics, exceptions, etc.), it is captured alongside the
-structured lines, making anomalies immediately visible by their deviation
-from the expected pattern.
+Server output is stored verbatim. The WTFUZZ structured log format
+(``WTFUZZ|<conn_idx>|EVENT|k=v|...``) is self-describing; raw lines
+(panics, tracebacks) are captured alongside structured ones so anomalies
+stand out by their deviation from the expected pattern.
 
-sent_data is stored as newline-separated step strings, one per step:
-    oneshot:   "capsule(6843040000000000)"
-    multistep: "bidi(48454c4c4f)\\ncapsule(800078ae00)\\ncapsule(68430400000000)"
+``sent_data`` examples::
 
-Each line is of the form  action(hex-payload)  where action is one of:
-capsule, bidi, uni, datagram, sleep.
+    oneshot   : "capsule(6843040000000000)"
+    multistep : "bidi(48454c4c4f)\\ncapsule(800078ae00)\\ncapsule(68430400000000)"
+
+Each line is ``action(hex-payload)`` where ``action`` is one of
+``capsule`` / ``bidi`` / ``uni`` / ``datagram``.
 """
 
 import hashlib

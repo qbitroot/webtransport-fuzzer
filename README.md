@@ -71,10 +71,9 @@ Each **scenario** is a list of steps, where each step is one of:
 | Step            | What happens                                                                                              |
 | --------------- | --------------------------------------------------------------------------------------------------------- |
 | `bidi(hex)`     | Opens a bidirectional WebTransport stream, sends payload, awaits echo (1 s timeout; timeout is non-fatal) |
-| `uni(hex)`      | Opens a unidirectional stream, sends payload, no echo expected                                            |
-| `datagram(hex)` | Sends a QUIC datagram                                                                                     |
-| `capsule(hex)`  | Sends a raw WebTransport capsule on the CONNECT stream                                                    |
-| `sleep(Xs)`     | Pause between steps                                                                                       |
+| `uni(hex)`      | Opens a unidirectional stream, sends payload, awaits server-pushed echo on a peer stream                  |
+| `datagram(hex)` | Sends a QUIC datagram, awaits echoed datagram                                                             |
+| `capsule(hex)`  | Sends a raw WebTransport capsule on the CONNECT stream (no echo expected)                                 |
 
 The **mutator** generates all interesting variants from each scenario:
 
@@ -86,7 +85,7 @@ The **mutator** generates all interesting variants from each scenario:
 - Prohibited capsule injection at every position (`WT_MAX_STREAM_DATA` / `WT_STREAM_DATA_BLOCKED`, which MUST cause a session error per draft-15 §5.4)
 - Post-CLOSE activity: bidi/uni/datagram/capsule sent after a CLOSE_SESSION
 
-**~920 unique test cases across 12 scenarios.**
+**~1,500 unique test cases across 12 scenarios** (with `MAX_PERMUTATIONS=5040`).
 
 #### Scenarios
 
@@ -203,13 +202,15 @@ Standard logging (warnings, stack traces) goes to **stderr** and is not captured
 ```
 main.py                 — CLI entry point, boofuzz Session setup
 src/
-  boofuzz_definitions.py  — oneshot capsule definitions; multistep scenarios
-  sequence_mutator.py     — step type helpers; mutation engine (permute/dup/omit/inject)
-  fuzzer_connection.py    — boofuzz ITargetConnection; executes step scenarios
+  boofuzz_definitions.py  — Tier-A spec-aware + Tier-B raw oneshot corpus;
+                            named multistep scenarios; QuicVarInt sizer
+  quic_varint_fuzzable.py — custom boofuzz Fuzzable for QUIC VarInts (RFC 9000 §16)
+  sequence_mutator.py     — Step / Scenario types; mutation engine; ScenarioRegistry
+  fuzzer_connection.py    — boofuzz ITargetConnection; per-step outcome capture
   webtransport_client.py  — aioquic WebTransport client (bidi/uni/datagram/capsule)
-  echo_monitor.py         — post-test health check via echo probe
+  echo_monitor.py         — per-step echo verification, optional fail-on-mismatch
   request_logger.py       — boofuzz monitor that writes test cases to SQLite
-  log_db.py               — SQLite schema and access
+  log_db.py               — SQLite schema + access
   server_manager.py       — optional server subprocess lifecycle
 analyze_logs.py           — offline log correlation tool
 get-server-version.py     — server draft-version fingerprinting tool

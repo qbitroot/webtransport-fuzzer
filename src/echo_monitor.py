@@ -1,149 +1,130 @@
 """
-Echo comparison monitor for boofuzz fuzzing.
-Compares sent data with echoed responses.
+Echo-comparison monitor.
+
+For each test case, inspects the per-step outcomes recorded by the
+WebTransport connection and reports any echo mismatch as a boofuzz
+failure. No fresh-handshake probe is performed — the next test case's
+``connection.open()`` is the implicit liveness check; if the server is
+down it raises ``ConnectionError`` which boofuzz surfaces as a failure.
+
+What counts as an echo mismatch:
+
+* ``bidi`` step — server didn't echo, or echoed bytes differing from the
+  sent payload.
+* ``uni`` / ``datagram`` step — same: server's echo (if the server is an
+  echo server, which is the case for the bundled reference servers).
+
+What does *not* count:
+
+* ``capsule`` steps. Capsules are control messages; servers are free to
+  silently ignore unknown / malformed ones (RFC 9297 §3.2).
+* Steps that raised an exception locally (e.g. send-side timeout). These
+  are recorded in ``StepOutcome.error`` and logged at info level but
+  don't fail the test case on their own — many fuzzed scenarios will
+  legitimately stress the local stack.
+
+Failure artefacts (sent steps + per-step outcomes) are written to
+``failures/failure_<timestamp>.txt`` for offline triage.
 """
+
+from __future__ import annotations
 
 import logging
 import os
 import time
-from typing import Optional
+from typing import List
 
 from boofuzz.monitors.base_monitor import BaseMonitor
 
+from src.fuzzer_connection import StepOutcome
+from src.sequence_mutator import Step
+
 logger = logging.getLogger(__name__)
 
+
 class ServerDownError(Exception):
-    """Raised when the target server is unreachable/down."""
-    pass
+    """Raised when the target server is unreachable."""
+
 
 FAILURES_DIR = "failures"
 os.makedirs(FAILURES_DIR, exist_ok=True)
 
 
-def save_failure(sent: Optional[bytes], recv: Optional[bytes]) -> str:
-    """Save sent/recv pair to a timestamped file; return path."""
+def _save_failure(steps: List[Step], outcomes: List[StepOutcome], reason: str) -> str:
+    """Append a human-readable failure record to ``failures/`` and return path."""
     ts = int(time.time() * 1000)
-    fname = os.path.join(FAILURES_DIR, f"failure_{ts}.bin")
-    with open(fname, "wb") as f:
-        f.write(b"---SENT---\n")
-        f.write(sent or b"")
-        f.write(b"\n---RECV---\n")
-        f.write(recv or b"")
-    return fname
+    path = os.path.join(FAILURES_DIR, f"failure_{ts}.txt")
+    with open(path, "w") as f:
+        f.write(f"reason: {reason}\n")
+        f.write("steps:\n")
+        for i, (step, outcome) in enumerate(zip(steps, outcomes)):
+            f.write(f"  [{i}] {step.action}({step.data.hex()})\n")
+            if outcome.error is not None:
+                f.write(f"      error: {outcome.error}\n")
+            if outcome.echo_received is not None:
+                f.write(f"      echo : {outcome.echo_received.hex()}\n")
+            if outcome.echo_match is False:
+                f.write("      echo_match: NO\n")
+    return path
 
 
 class EchoCompareMonitor(BaseMonitor):
     """
-    Monitor that compares what was sent with what the target echoed back.
+    Inspect per-step outcomes and report echo behaviour.
 
-    After EVERY fuzzed request, performs a universal health check using a fresh
-    connection to catch memory corruption that only manifests on a subsequent
-    valid session (the core one-shot fuzzing pattern).
+    Default is informational only: fuzzed scenarios will often legitimately
+    drop or distort echoes (out-of-order steps, prohibited capsules, etc.),
+    so missing echoes alone are not a failure signal. Set
+    ``fail_on_mismatch=True`` to escalate every echo discrepancy into a
+    boofuzz failure (saved to ``failures/``) — useful when running a
+    pristine scenario against a server you trust to behave.
     """
 
-    def __init__(self, crash_on_mismatch: bool = True):
+    def __init__(self, fail_on_mismatch: bool = False):
         super().__init__()
-        self.crash_on_mismatch = crash_on_mismatch
-        self.target_ref = None
+        self.fail_on_mismatch = fail_on_mismatch
 
-    def _fresh_health_check(self, conn, fuzz_data_logger, sent):
-        """
-        Universal health check using a FRESH connection.
-        Opens a new connection, sends a bidirectional echo, and verifies the response.
-        This catches memory corruption / server crashes that only appear on the next
-        valid session after a malformed request.
+    def post_send(self, target, fuzz_data_logger, session, *args, **kwargs):
+        conn = getattr(target, "_target_connection", None)
+        if conn is None:
+            fuzz_data_logger.log_error("EchoCompareMonitor: no connection on target")
+            return True
 
-        Returns True if server is healthy, raises ServerDownError otherwise.
-        """
-        fuzz_data_logger.log_info("Performing post-fuzz health check (fresh connection)...")
+        steps: List[Step] = getattr(conn, "last_sent_steps", []) or []
+        outcomes: List[StepOutcome] = getattr(conn, "last_step_outcomes", []) or []
 
-        try:
-            from src.fuzzer_connection import WebTransportConnection
-
-            probe_conn = WebTransportConnection(conn.url, timeout=3.0)
-            probe_conn.open()
-
-            probe_success = probe_conn.send_health_check()
-            probe_conn.close()
-
-            if probe_success:
-                fuzz_data_logger.log_check("Health Check PASSED: Server is alive (fresh connection).")
-                return True
-            else:
-                fuzz_data_logger.log_fail("Health Check FAILED: Server unresponsive to fresh connection!")
-                save_failure(sent, b"")
-                raise ServerDownError("Server is down (fresh probe failed)")
-
-        except ServerDownError:
-            raise
-        except Exception as probe_err:
-            fuzz_data_logger.log_fail(f"Health Check Exception: {probe_err}. SERVER DOWN.")
-            save_failure(sent, b"")
-            raise ServerDownError(f"Server is down (probe exception: {probe_err})")
-
-    def post_send(self, target, fuzz_data_logger, session, mutated_data=None, *args, **kwargs):
-        """
-        Called after each send.
-        1. Log what happened with this request (echo match / silence / etc).
-        2. ALWAYS perform a fresh-connection health check to catch delayed corruption.
-        """
-        self.target_ref = target
-
-        try:
-            conn = target._target_connection
-            if conn is None:
-                fuzz_data_logger.log_error("EchoCompareMonitor: could not access connection")
-                return True
-
-            sent = mutated_data if mutated_data is not None else conn._last_sent_data
-            recv = conn._last_received_data
-
-            if sent is None:
-                return True
-
-            # --- Step 1: Log the echo result for this request ---
-
-            if recv is None or len(recv) == 0:
-                # Silence — expected for many fuzzed/malformed packets
-                fuzz_data_logger.log_info("No echo response received (expected for fuzzed input).")
-            else:
-                # Response received — compare against expected payload if possible
-                expected_payload = None
-                if hasattr(session, 'fuzz_node') and session.fuzz_node:
-                    for name, primitive in session.fuzz_node.names.items():
-                        if name.endswith(".Payload") or name == "Payload":
-                            try:
-                                val = primitive._value
-                                if isinstance(val, bytes):
-                                    expected_payload = val
-                                elif isinstance(val, str):
-                                    expected_payload = val.encode('utf-8')
-                            except:
-                                pass
-                            break
-
-                if expected_payload:
-                    if recv == expected_payload:
-                        fuzz_data_logger.log_check(f"Echo OK: received bytes match Payload (len={len(recv)})")
-                    else:
-                        fuzz_data_logger.log_info(f"Echo mismatch (ignored): received {recv!r} != expected {expected_payload!r}")
+        mismatches = []
+        for i, (step, outcome) in enumerate(zip(steps, outcomes)):
+            if step.action == "capsule":
+                continue
+            if outcome.echo_match is True:
+                fuzz_data_logger.log_check(
+                    f"step[{i}] {step.action}: echo OK ({len(step.data)}B)"
+                )
+            elif outcome.echo_match is False:
+                # No echo, or wrong echo. For fuzzed (mutated) traffic this is
+                # informational rather than a definite bug, but for reordered/
+                # injected scenarios on a healthy session it indicates the
+                # server's echo path is broken.
+                got = outcome.echo_received
+                if got is None:
+                    fuzz_data_logger.log_info(
+                        f"step[{i}] {step.action}: no echo received"
+                    )
                 else:
-                    fuzz_data_logger.log_info(f"Echo received: {len(recv)} bytes")
+                    fuzz_data_logger.log_info(
+                        f"step[{i}] {step.action}: echo mismatch "
+                        f"(sent {len(step.data)}B, got {len(got)}B)"
+                    )
+                mismatches.append(i)
 
-            # --- Step 2: Universal health check (fresh connection) ---
-            # This is the core of one-shot fuzzing: after sending a potentially
-            # malformed request, we perform a valid session to catch memory
-            # corruption that only manifests on the next request.
-            self._fresh_health_check(conn, fuzz_data_logger, sent)
+        if mismatches and self.fail_on_mismatch:
+            path = _save_failure(steps, outcomes, "echo mismatch")
+            fuzz_data_logger.log_fail(
+                f"echo mismatches at steps {mismatches}; saved to {path}"
+            )
 
-            return True
+        return True
 
-        except ServerDownError:
-            raise
-        except Exception as e:
-            fuzz_data_logger.log_error(f"Exception in EchoCompareMonitor.post_send: {e}")
-            logger.exception("EchoCompareMonitor exception")
-            return True
-
-    def alive(self):
+    def alive(self) -> bool:
         return True

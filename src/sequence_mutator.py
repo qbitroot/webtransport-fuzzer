@@ -1,242 +1,236 @@
 """
-Sequence mutation engine for multistep capsule fuzzing.
+Step + Scenario types and the multistep mutation engine.
 
-A scenario is a list of Steps. Each step is an action the fuzzer performs
-on a live WebTransport session: send a bidi stream, send a datagram,
-inject a capsule, wait briefly, etc.
+A scenario is a tuple of Steps. Each Step is an action the fuzzer performs
+on a live WebTransport session: send a bidi stream, send a uni stream,
+send a datagram, or inject a raw capsule.
 
 The mutator takes a scenario and generates all interesting re-orderings:
-permutations, duplications, omissions, rapid-fire, and prohibited-capsule
-injections — while preserving the action types so the connection knows
-how to execute each step.
+permutations, duplications, omissions, rapid-fire bursts, reversal, and
+prohibited-capsule injections. All operators preserve action types so the
+connection knows how to execute each step.
+
+For boofuzz transport, scenarios are not encoded into bytes directly.
+Instead, ``ScenarioRegistry`` assigns each unique scenario a sequential
+integer id, and the bytes value handed to ``s_group`` is a fixed-width
+8-byte token of the form ``b"WTSC" + id (BE u32)``. The connection
+decodes the token and looks up the scenario by id at send time. This
+avoids JSON-in-bytes encoding entirely.
 """
 
+from __future__ import annotations
+
 import itertools
-import json
 import struct
-from typing import List, Tuple, Dict, Any
+from dataclasses import dataclass
+from typing import Iterable, List, Tuple
 
 from src.boofuzz_definitions import encode_quic_varint
 
 
-# ---- Step types ----
-# Each step is a dict: {"action": str, ...params}
-#
-#   {"action": "bidi",     "data": b"hello"}        — send on bidi stream, await echo
-#   {"action": "uni",      "data": b"fire"}          — send on uni stream (fire-and-forget)
-#   {"action": "datagram", "data": b"ping"}           — send datagram
-#   {"action": "capsule",  "data": b"\x68\x43..."}   — raw capsule bytes on CONNECT stream
-#   {"action": "sleep",    "seconds": 0.05}           — pause between steps
+# ---- Step type ----
+
+Action = str  # "bidi" | "uni" | "datagram" | "capsule"
 
 
-def step_bidi(data: bytes) -> dict:
-    """Create a bidirectional stream step (sends data, server echoes)."""
-    return {"action": "bidi", "data": data}
+@dataclass(frozen=True)
+class Step:
+    """A single step in a multistep scenario.
+
+    Attributes:
+        action: One of ``bidi``, ``uni``, ``datagram``, ``capsule``.
+        data:   Payload bytes for the action.
+
+    The class is frozen so it is hashable, which lets us dedupe whole
+    scenarios via tuple-of-Step set membership.
+    """
+
+    action: Action
+    data: bytes
+
+    def __repr__(self) -> str:  # pragma: no cover — for debug only
+        return f"Step({self.action}, {len(self.data)}B)"
 
 
-def step_uni(data: bytes) -> dict:
-    """Create a unidirectional stream step (fire-and-forget)."""
-    return {"action": "uni", "data": data}
+Scenario = Tuple[Step, ...]
 
 
-def step_datagram(data: bytes) -> dict:
-    """Create a datagram step."""
-    return {"action": "datagram", "data": data}
+def step_bidi(data: bytes) -> Step:
+    """Bidirectional stream step (sends data, server echoes)."""
+    return Step("bidi", data)
 
 
-def step_capsule(data: bytes) -> dict:
-    """Create a capsule step (raw bytes on CONNECT stream)."""
-    return {"action": "capsule", "data": data}
+def step_uni(data: bytes) -> Step:
+    """Unidirectional stream step (fire-and-forget; server may echo)."""
+    return Step("uni", data)
 
 
-def step_sleep(seconds: float = 0.05) -> dict:
-    """Create a sleep/delay step."""
-    return {"action": "sleep", "seconds": seconds}
+def step_datagram(data: bytes) -> Step:
+    """Datagram step (unreliable, server may echo)."""
+    return Step("datagram", data)
 
 
-# ---- Prohibited capsule types (draft-15 §5.4) ----
+def step_capsule(data: bytes) -> Step:
+    """Raw capsule on the CONNECT stream (session control channel)."""
+    return Step("capsule", data)
+
+
+# ---- Prohibited capsule types (draft-ietf-webtrans-http3-14 §5.4) ----
+
 CAPSULE_MAX_STREAM_DATA = b"\x99\x0b\x4d\x3e"  # 0x190B4D3E
 CAPSULE_STREAM_DATA_BLOCKED = b"\x99\x0b\x4d\x42"  # 0x190B4D42
 
 
-def _build_prohibited_capsules() -> List[Tuple[str, bytes]]:
-    """Build well-formed but prohibited capsules for injection testing."""
+def _build_prohibited_capsules() -> List[bytes]:
+    """Well-formed capsules whose receipt MUST be a session error per spec."""
     capsules = []
-
-    # WT_MAX_STREAM_DATA with stream_id=4, limit=999
+    # WT_MAX_STREAM_DATA(stream_id=4, limit=999)
     payload = encode_quic_varint(4) + encode_quic_varint(999)
-    capsule = CAPSULE_MAX_STREAM_DATA + encode_quic_varint(len(payload)) + payload
-    capsules.append(("WT_MAX_STREAM_DATA", capsule))
-
-    # WT_STREAM_DATA_BLOCKED with stream_id=4, limit=999
+    capsules.append(
+        CAPSULE_MAX_STREAM_DATA + encode_quic_varint(len(payload)) + payload
+    )
+    # WT_STREAM_DATA_BLOCKED(stream_id=4, limit=999)
     payload = encode_quic_varint(4) + encode_quic_varint(999)
-    capsule = CAPSULE_STREAM_DATA_BLOCKED + encode_quic_varint(len(payload)) + payload
-    capsules.append(("WT_STREAM_DATA_BLOCKED", capsule))
-
+    capsules.append(
+        CAPSULE_STREAM_DATA_BLOCKED + encode_quic_varint(len(payload)) + payload
+    )
     return capsules
 
 
 PROHIBITED_CAPSULES = _build_prohibited_capsules()
 
-MAX_PERMUTATIONS = 5040  # 7! = 5040 — exhaust all permutations of current
-# scenarios (longest = kitchen_sink, 6 steps, 720 perms) with headroom for any
-# future 7-step scenario before truncation kicks in. Truncation matters because
-# permutation order is *the* fuzzer signal for scenarios: clipping at 5! masks
-# state-confusion bugs that only manifest under specific late-position step
-# orderings (e.g. capsule-after-multiple-data interactions in kitchen_sink).
+MAX_PERMUTATIONS = 5040  # 7! — see boofuzz_definitions for rationale
 
 
-def _step_key(step: dict) -> bytes:
-    """Deterministic key for deduplication."""
-    if step["action"] == "sleep":
-        return b"sleep:" + str(step["seconds"]).encode()
-    return step["action"].encode() + b":" + step.get("data", b"")
+# ---- Mutation engine ----
 
 
-def _seq_key(steps: List[dict]) -> bytes:
-    """Deduplicate entire sequences."""
-    return b"|".join(_step_key(s) for s in steps)
-
-
-def generate_sequence_mutations(
-    scenario: List[dict],
-    include_permutations: bool = True,
-    include_duplications: bool = True,
-    include_omissions: bool = True,
-    include_rapid_fire: bool = True,
-    include_injections: bool = True,
-) -> List[List[dict]]:
+def generate_sequence_mutations(scenario: Scenario) -> List[Scenario]:
     """
     Generate all interesting mutations of a step scenario.
 
-    Args:
-        scenario: Ordered list of step dicts.
-
-    Returns:
-        List of mutated scenarios. Each is a list of step dicts.
+    The returned list is deduplicated and order-preserved (insertion
+    order). Each mutation is a tuple of Steps so callers can use a set
+    keyed directly on the tuple for global dedup.
     """
-    seen = set()
-    mutations: List[List[dict]] = []
+    seen: set[Scenario] = set()
+    out: List[Scenario] = []
 
-    def _add(seq: List[dict]):
-        key = _seq_key(seq)
-        if key not in seen:
-            seen.add(key)
-            mutations.append(seq)
+    def add(seq: Iterable[Step]) -> None:
+        s = tuple(seq)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
 
-    # 0. Original order (baseline)
-    _add(scenario[:])
+    scenario = tuple(scenario)
+    n = len(scenario)
+    add(scenario)
 
-    # 1. All permutations (capped)
-    if include_permutations and len(scenario) > 1:
-        count = 0
-        for perm in itertools.permutations(scenario):
-            _add(list(perm))
-            count += 1
-            if count >= MAX_PERMUTATIONS:
+    # 1. Permutations (capped)
+    if n > 1:
+        for i, perm in enumerate(itertools.permutations(scenario)):
+            if i >= MAX_PERMUTATIONS:
                 break
+            add(perm)
 
-    # 2. Each step duplicated at its position
-    if include_duplications:
-        for i in range(len(scenario)):
-            dup = scenario[:i] + [scenario[i], scenario[i]] + scenario[i + 1 :]
-            _add(dup)
+    # 2. Each step duplicated in place, then duplicated at end
+    for i in range(n):
+        add(scenario[:i] + (scenario[i], scenario[i]) + scenario[i + 1 :])
+    for i in range(n):
+        add(scenario + (scenario[i],))
 
-    # 3. Each step duplicated at end
-    if include_duplications:
-        for i in range(len(scenario)):
-            _add(scenario[:] + [scenario[i]])
+    # 3. Each step omitted
+    if n > 1:
+        for i in range(n):
+            add(scenario[:i] + scenario[i + 1 :])
 
-    # 4. Each step omitted
-    if include_omissions and len(scenario) > 1:
-        for i in range(len(scenario)):
-            omit = scenario[:i] + scenario[i + 1 :]
-            if omit:
-                _add(omit)
+    # 4. Rapid-fire: same step repeated 2/5/10×
+    for step in scenario:
+        for k in (2, 5, 10):
+            add((step,) * k)
 
-    # 5. Rapid-fire: same step repeated N times
-    if include_rapid_fire:
-        for step in scenario:
-            if step["action"] == "sleep":
-                continue
-            for n in [2, 5, 10]:
-                _add([step] * n)
+    # 5. Reversed order
+    if n > 1:
+        add(scenario[::-1])
 
-    # 6. Reversed order
-    if len(scenario) > 1:
-        _add(scenario[::-1])
+    # 6. Inject prohibited capsule at every position
+    for i in range(n + 1):
+        for prohibited in PROHIBITED_CAPSULES:
+            add(scenario[:i] + (step_capsule(prohibited),) + scenario[i:])
 
-    # 7. Inject prohibited capsule at each position
-    if include_injections:
-        for i in range(len(scenario) + 1):
-            for _name, prohibited in PROHIBITED_CAPSULES:
-                injected = scenario[:i] + [step_capsule(prohibited)] + scenario[i:]
-                _add(injected)
+    # 7. Post-CLOSE_SESSION activity: probe whether the server still serves
+    #    streams/datagrams after a graceful close
+    from src.boofuzz_definitions import CAPSULE_CLOSE_SESSION, CAPSULE_DRAIN_SESSION
 
-    # 8. Post-close injection: if scenario has a capsule that looks like CLOSE,
-    #    inject data activity after it
-    if include_injections:
-        from src.boofuzz_definitions import CAPSULE_CLOSE_SESSION, CAPSULE_DRAIN_SESSION
+    drain_capsule = CAPSULE_DRAIN_SESSION + b"\x00"
+    after_close_steps = [
+        step_bidi(b"AFTERCLOSE"),
+        step_uni(b"AFTERCLOSE"),
+        step_datagram(b"AFTERCLOSE"),
+        step_capsule(drain_capsule),
+    ] + [step_capsule(p) for p in PROHIBITED_CAPSULES]
 
-        for i, s in enumerate(scenario):
-            if (
-                s["action"] == "capsule"
-                and s["data"][: len(CAPSULE_CLOSE_SESSION)] == CAPSULE_CLOSE_SESSION
-            ):
-                # Send bidi after close — should the server still echo?
-                _add(scenario[: i + 1] + [step_bidi(b"AFTERCLOSE")])
-                # Send uni after close
-                _add(scenario[: i + 1] + [step_uni(b"AFTERCLOSE")])
-                # Send datagram after close
-                _add(scenario[: i + 1] + [step_datagram(b"AFTERCLOSE")])
-                # Send drain after close
-                drain_bytes = CAPSULE_DRAIN_SESSION + b"\x00"
-                _add(scenario[: i + 1] + [step_capsule(drain_bytes)])
-                # Send prohibited after close
-                for _name, prohibited in PROHIBITED_CAPSULES:
-                    _add(scenario[: i + 1] + [step_capsule(prohibited)])
+    for i, step in enumerate(scenario):
+        if step.action == "capsule" and step.data.startswith(CAPSULE_CLOSE_SESSION):
+            for follow in after_close_steps:
+                add(scenario[: i + 1] + (follow,))
 
-    return mutations
+    return out
 
 
-# ---- Encoding / decoding for boofuzz transport ----
-# We encode a scenario (list of step dicts) as JSON inside a binary envelope
-# so boofuzz s_group can hold it as bytes, and the connection can decode it.
+# ---- Scenario registry: bytes-token <-> Scenario lookup for boofuzz s_group ----
 
-SCENARIO_MAGIC = b"WTSC"  # WebTransport SCenario
-
-
-def encode_scenario(steps: List[dict]) -> bytes:
-    """Encode a scenario into bytes for boofuzz s_group storage."""
-    # Convert bytes fields to hex strings for JSON serialization
-    serializable = []
-    for step in steps:
-        s = dict(step)
-        if "data" in s and isinstance(s["data"], bytes):
-            s["data"] = s["data"].hex()
-        serializable.append(s)
-    payload = json.dumps(serializable, separators=(",", ":")).encode("utf-8")
-    return SCENARIO_MAGIC + struct.pack(">I", len(payload)) + payload
+_SCENARIO_MAGIC = b"WTSC"
+_SCENARIO_TOKEN_LEN = len(_SCENARIO_MAGIC) + 4  # magic + uint32 BE
 
 
-def decode_scenario(data: bytes) -> List[dict]:
-    """Decode a scenario from its binary envelope."""
-    if not data.startswith(SCENARIO_MAGIC):
-        raise ValueError("Not a scenario-encoded payload")
-    offset = len(SCENARIO_MAGIC)
-    (length,) = struct.unpack(">I", data[offset : offset + 4])
-    offset += 4
-    payload = data[offset : offset + length]
-    raw = json.loads(payload.decode("utf-8"))
-    # Convert hex strings back to bytes
-    steps = []
-    for s in raw:
-        if "data" in s and isinstance(s["data"], str):
-            s["data"] = bytes.fromhex(s["data"])
-        steps.append(s)
-    return steps
+class ScenarioRegistry:
+    """
+    Per-process registry that assigns each unique scenario a sequential id
+    and produces a fixed-width 8-byte token suitable for ``s_group``.
+
+    A single global registry is sufficient because boofuzz session
+    definitions are only built once per run and live in the same process
+    as the connection that resolves them at send time.
+    """
+
+    def __init__(self) -> None:
+        self._scenarios: List[Scenario] = []
+        self._index: dict[Scenario, int] = {}
+
+    def __len__(self) -> int:
+        return len(self._scenarios)
+
+    def register(self, scenario: Scenario) -> bytes:
+        """Return the token for ``scenario``, registering it if new."""
+        scenario = tuple(scenario)
+        idx = self._index.get(scenario)
+        if idx is None:
+            idx = len(self._scenarios)
+            self._scenarios.append(scenario)
+            self._index[scenario] = idx
+        return _SCENARIO_MAGIC + struct.pack(">I", idx)
+
+    def lookup(self, token: bytes) -> Scenario:
+        """Decode a token back into the registered scenario."""
+        if not is_scenario_token(token):
+            raise ValueError("Not a scenario token")
+        (idx,) = struct.unpack(">I", token[len(_SCENARIO_MAGIC) :])
+        try:
+            return self._scenarios[idx]
+        except IndexError:
+            raise ValueError(f"Unknown scenario id {idx}") from None
+
+    def reset(self) -> None:
+        """Drop all registered scenarios. Useful for tests / repeated runs."""
+        self._scenarios.clear()
+        self._index.clear()
 
 
-def is_scenario_encoded(data: bytes) -> bool:
-    """Check if data starts with the scenario magic."""
-    return data.startswith(SCENARIO_MAGIC)
+# Process-wide registry shared by definitions (writers) and the connection (reader).
+SCENARIOS = ScenarioRegistry()
+
+
+def is_scenario_token(data: bytes) -> bool:
+    """True if ``data`` is a fixed-width scenario token."""
+    return len(data) == _SCENARIO_TOKEN_LEN and data.startswith(_SCENARIO_MAGIC)
