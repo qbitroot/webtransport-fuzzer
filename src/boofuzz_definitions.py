@@ -5,6 +5,9 @@ from boofuzz import (
     s_get,
     s_random,
     s_byte,
+    s_block,
+    s_dword,
+    s_string,
 )
 
 # =============================================================================
@@ -108,6 +111,15 @@ INTERESTING_NUMBERS = [
     4294967296,  # 32-bit boundaries
     4611686018427387902,
     4611686018427387903,  # Max QUIC VarInt (2^62 - 1)
+    # ---- Cross-protocol numeric boundaries (added for thesis breadth) ----
+    2147483647,  # INT32_MAX — common signed-int overflow trigger in C parsers
+    2147483648,  # INT32_MAX + 1 — first value that overflows a signed int32
+    8388607,  # HTTP/2 SETTINGS_INITIAL_WINDOW_SIZE max (RFC 9113 §6.5.2: 2^31-1
+    # is the cap, but 2^23-1 = 16MB is the per-frame DATA limit; tests parsers
+    # that erroneously reuse HTTP/2 window-size constants for capsule sizing)
+    9007199254740992,  # JS Number.MAX_SAFE_INTEGER + 1; tests JS-runtime
+    # implementations (e.g. Node.js WebTransport stacks) where IEEE-754 mantissa
+    # precision is lost beyond 2^53.
 ]
 VALID_VARINT_ENC = [encode_quic_varint(v) for v in INTERESTING_NUMBERS]
 
@@ -131,6 +143,18 @@ MALFORMED_VARINTS = [
     b"\xc0\x00\x00\x00\x00\x00\x00\x00",  # Valid 8-byte encoding of zero
     b"\xff\xff\xff\xff\xff\xff\xff\xff",  # 8 bytes of 0xFF (value exceeds 2^62-1, invalid)
     b"",  # Completely omitted field
+    # ---- Additional WebTransport-capsule overlong encodings ----
+    # RFC 9000 §16: VarInts SHOULD be canonically encoded; receivers MAY treat
+    # non-canonical encodings as a connection error. These probe whether the
+    # stack normalises before dispatching by capsule type, or rejects them.
+    b"\xc0\x00\x00\x00\x19\x0b\x4d\x41",  # WT_DATA_BLOCKED (0x190B4D41) overlong 8-byte
+    b"\xc0\x00\x00\x00\x19\x0b\x4d\x43",  # WT_STREAMS_BLOCKED bidi (0x190B4D43) overlong 8-byte
+    # ---- Overlong encodings of the 1-byte VarInt boundary (value 63) ----
+    # Per RFC 9000 §16, 63 fits in a single byte; encoding it with a wider
+    # prefix is non-canonical. Probes parser branches that handle encoded
+    # widths separately from value ranges (draft-ietf-quic-transport §16).
+    b"\x40\x3f",  # value 63 as overlong 2-byte VarInt
+    b"\x80\x00\x00\x3f",  # value 63 as overlong 4-byte VarInt
 ]
 
 # 4. QUIC and HTTP/3 Frame Types encoded as VarInts
@@ -205,29 +229,252 @@ ALL_INTERESTING_BYTES = list(
 # =============================================================================
 
 
+def _build_raw_fuzz_blobs() -> list:
+    """
+    Build the structure-agnostic ("raw") corpus for the oneshot fuzzer.
+
+    These blobs deliberately violate capsule framing to probe parser
+    robustness independent of any specific capsule type. Three sub-corpora,
+    all derived from ``ALL_INTERESTING_BYTES`` (which already mixes valid
+    capsule types, valid VarInts, malformed VarInts, and cross-layer QUIC/HTTP3
+    frame types):
+
+    * **Type-only frames**: a single interesting byte sequence with no
+      length and no body. Triggers truncation paths and single-byte
+      garbage handling (e.g. ``b"\\x41"`` — WT_STREAM signal byte sent
+      as a complete capsule).
+
+    * **Type + length, no body**: an interesting type followed by an
+      interesting (often invalid) length byte sequence and no payload.
+      Probes length/body length-mismatch handling.
+
+    * **Type + matched length + body**: an interesting type with a
+      canonically-encoded length matching the body. Tests well-framed
+      capsules carrying foreign payload — including cross-layer type
+      confusion (e.g. ``b"\\x40\\x41\\x01\\xff"`` — WT_STREAM signal
+      type carrying a single foreign byte).
+
+    Returns a deduplicated, order-preserving list of byte blobs.
+    """
+    blobs = []
+
+    # Sub-corpus 1: type-only (no length, no body)
+    for type_bytes in ALL_INTERESTING_BYTES:
+        blobs.append(type_bytes)
+
+    # Sub-corpus 2: type + length cross-product, no body
+    for type_bytes in ALL_INTERESTING_BYTES:
+        for length_bytes in ALL_INTERESTING_BYTES:
+            blobs.append(type_bytes + length_bytes)
+
+    # Sub-corpus 3: type + canonical length + body
+    for type_bytes in ALL_INTERESTING_BYTES:
+        for payload_bytes in ALL_INTERESTING_BYTES:
+            valid_length = encode_quic_varint(len(payload_bytes))
+            blobs.append(type_bytes + valid_length + payload_bytes)
+
+    # Order-preserving dedup
+    return list(dict.fromkeys(blobs))
+
+
+def _reset_request(name: str):
+    """
+    Remove a previously-initialised boofuzz Request from the global registry.
+
+    Boofuzz's ``s_initialize`` raises if a Request with the given name
+    already exists. The Tier-A sub-Requests are throw-away scaffolding
+    used solely to enumerate spec-aware mutations, so we want to be able
+    to rebuild them on every call to ``define_oneshot_capsule()``. This
+    helper drops the prior Request from ``boofuzz.blocks.REQUESTS`` and
+    clears ``blocks.CURRENT`` if it pointed at the same instance.
+    """
+    from boofuzz import blocks
+
+    if name in blocks.REQUESTS:
+        if blocks.CURRENT is blocks.REQUESTS[name]:
+            blocks.CURRENT = None
+        del blocks.REQUESTS[name]
+
+
+def _enumerate_request_renders(req):
+    """
+    Walk every mutation of a boofuzz Request and yield the rendered bytes.
+
+    Used to materialise sub-Requests' mutation outputs into a flat list,
+    so multiple specialised per-branch Requests can be unioned into the
+    single top-level oneshot Request without fighting boofuzz's lack of
+    native switch/case semantics on a top-level group selector.
+    """
+    from boofuzz.mutation_context import MutationContext
+
+    seen = set()
+    for mutations in req.get_mutations():
+        ctx = MutationContext(mutations={m.qualified_name: m for m in mutations})
+        rendered = req.render(mutation_context=ctx)
+        if rendered not in seen:
+            seen.add(rendered)
+            yield rendered
+
+
+def _build_tier_a_close_session():
+    """Build the WT_CLOSE_SESSION sub-Request (separate session-name)."""
+    from src.quic_varint_fuzzable import s_quic_varint
+
+    name = "__tier_a_close_session"
+    _reset_request(name)
+    s_initialize(name)
+    s_static(CAPSULE_CLOSE_SESSION, name="close_type")
+    s_quic_varint(name="close_len", block_name="close_payload")
+    with s_block("close_payload"):
+        s_dword(0, endian=">", name="close_error_code", fuzzable=True)
+        s_string("", max_len=1024, name="close_error_message", fuzzable=True)
+    return s_get(name)
+
+
+def _build_tier_a_simple_varint_capsule(name: str, type_bytes: bytes):
+    """
+    Build a sub-Request for a capsule whose payload is a single VarInt
+    (WT_MAX_DATA, WT_MAX_STREAMS_*, WT_DATA_BLOCKED, WT_STREAMS_BLOCKED_*).
+    """
+    from src.quic_varint_fuzzable import s_quic_varint
+
+    session_name = f"__tier_a_{name}"
+    _reset_request(session_name)
+    s_initialize(session_name)
+    s_static(type_bytes, name=f"{name}_type")
+    s_quic_varint(name=f"{name}_len", block_name=f"{name}_payload")
+    with s_block(f"{name}_payload"):
+        s_quic_varint(name=f"{name}_value", default_value=0)
+    return s_get(session_name)
+
+
+def _build_tier_a_drain_session():
+    """Build the WT_DRAIN_SESSION sub-Request (empty payload per spec)."""
+    from src.quic_varint_fuzzable import s_quic_varint
+
+    name = "__tier_a_drain_session"
+    _reset_request(name)
+    s_initialize(name)
+    s_static(CAPSULE_DRAIN_SESSION, name="drain_type")
+    s_quic_varint(name="drain_len", block_name="drain_payload")
+    with s_block("drain_payload"):
+        s_static(b"", name="drain_payload_empty")
+    return s_get(name)
+
+
+def _build_tier_a_blobs() -> list:
+    """
+    Materialise every Tier-A spec-aware sub-Request into a deduplicated
+    list of fully-rendered byte sequences.
+
+    This is necessary because boofuzz lacks native switch/case semantics
+    at the top-level Request: ``s_block(group=...)`` iterates but does
+    not gate rendering, and ``s_block(dep=...)`` gates rendering but
+    only triggers a single render-pass per group-value. Combining both
+    leaves branch-internal mutations un-paired with the selector.
+
+    Workaround: define each branch as its own sub-Request, exhaust its
+    mutation generator, dedup, and union the resulting bytes into the
+    top-level oneshot ``s_group`` together with the Tier-B raw blobs.
+
+    The advantages of native boofuzz primitives — ``s_dword`` boundary
+    cases, ``s_string`` SPIKE-derived mutations (format strings, oversize
+    buffers, UTF-8 boundaries), and the ``QuicVarInt`` sizer's spec-aware
+    integer + malformed-byte mutation pool — are preserved by this
+    approach because the sub-Requests run those primitives during
+    enumeration. Only the runtime laziness of mutation generation is
+    given up; this is acceptable because the corpus is built once at
+    fuzz-session start.
+    """
+    blobs = []
+    blobs.extend(_enumerate_request_renders(_build_tier_a_close_session()))
+    blobs.extend(_enumerate_request_renders(_build_tier_a_drain_session()))
+    blobs.extend(
+        _enumerate_request_renders(
+            _build_tier_a_simple_varint_capsule("max_data", CAPSULE_MAX_DATA)
+        )
+    )
+    blobs.extend(
+        _enumerate_request_renders(
+            _build_tier_a_simple_varint_capsule(
+                "max_streams_bidi", CAPSULE_MAX_STREAMS_BIDI
+            )
+        )
+    )
+    blobs.extend(
+        _enumerate_request_renders(
+            _build_tier_a_simple_varint_capsule(
+                "max_streams_uni", CAPSULE_MAX_STREAMS_UNI
+            )
+        )
+    )
+    blobs.extend(
+        _enumerate_request_renders(
+            _build_tier_a_simple_varint_capsule("data_blocked", CAPSULE_DATA_BLOCKED)
+        )
+    )
+    blobs.extend(
+        _enumerate_request_renders(
+            _build_tier_a_simple_varint_capsule(
+                "streams_blocked_bidi", CAPSULE_STREAMS_BLOCKED_BIDI
+            )
+        )
+    )
+    blobs.extend(
+        _enumerate_request_renders(
+            _build_tier_a_simple_varint_capsule(
+                "streams_blocked_uni", CAPSULE_STREAMS_BLOCKED_UNI
+            )
+        )
+    )
+    return list(dict.fromkeys(blobs))
+
+
 def define_oneshot_capsule(session_name="wt_oneshot"):
     """
-    One-shot capsule fuzzer.
-    Format: [CapsuleType (fuzzed)][CapsuleLength (fuzzed)][Payload (optional)]
+    One-shot capsule fuzzer (Tier-A spec-aware + Tier-B raw) — flattened.
+
+    The corpus is built in two tiers and unioned into a single top-level
+    ``s_group`` so boofuzz's session machinery (resume via ``index_start``/
+    ``index_end``, web UI test-case enumeration, monitor invocation) sees
+    a flat enumeration of byte blobs:
+
+    **Tier A — spec-typed capsule branches** (draft-ietf-webtrans-http3-14 §4.7):
+      * ``close_session`` — WT_CLOSE_SESSION (0x2843): 32-bit BE Application
+        Error Code (boofuzz ``s_dword`` mutations) + UTF-8 Error Message
+        ≤ 1024 B (boofuzz ``s_string`` SPIKE-derived mutations).
+      * ``drain_session`` — WT_DRAIN_SESSION (0x78AE): empty payload.
+      * ``max_data`` — WT_MAX_DATA (0x190B4D3D): single VarInt payload.
+      * ``max_streams_bidi`` / ``max_streams_uni`` — WT_MAX_STREAMS
+        (0x190B4D3F / 0x190B4D40): single VarInt payload.
+      * ``data_blocked`` — WT_DATA_BLOCKED (0x190B4D41): single VarInt.
+      * ``streams_blocked_bidi`` / ``streams_blocked_uni`` —
+        WT_STREAMS_BLOCKED (0x190B4D43 / 0x190B4D44): single VarInt.
+
+      Each branch's Length field is a real ``QuicVarInt`` sizer that
+      recomputes from the (possibly-mutated) payload — so payload
+      mutations naturally drive length-field mutations consistent with
+      RFC 9000 §16 canonical encoding.
+
+    **Tier B — structure-agnostic raw**:
+      ``_build_raw_fuzz_blobs()`` covers single-byte frames, type-only
+      frames, type+length-only frames, and type+length+body frames
+      including cross-layer (QUIC/HTTP3 frame-type) confusion blobs.
     """
+    # Build Tier-A first (it consumes throw-away sub-Request names), then
+    # initialise the public top-level Request. Resetting the public name
+    # also makes the function safe to call multiple times in the same
+    # interpreter session (e.g. tests, REPL inspection).
+    tier_a = _build_tier_a_blobs()
+    tier_b = _build_raw_fuzz_blobs()
+
+    _reset_request(session_name)
     s_initialize(session_name)
 
-    # 1. Capsule Type — Use all merged interesting bytes
-    s_group(values=ALL_INTERESTING_BYTES, name="CapsuleType")
+    # Order-preserving union: Tier A first (spec-aware), then Tier B (raw).
+    all_blobs = list(dict.fromkeys(tier_a + tier_b))
 
-    # 2. & 3. Capsule Length + Payload combined to ensure valid lengths for bodies
-    length_and_payload = []
-
-    # Half cases WITHOUT body: length is fuzzed, body is empty
-    for length_bytes in ALL_INTERESTING_BYTES:
-        length_and_payload.append(length_bytes + b"")
-
-    # Half cases WITH body: length is valid, body is an "interesting" payload
-    for payload_bytes in ALL_INTERESTING_BYTES:
-        valid_length = encode_quic_varint(len(payload_bytes))
-        length_and_payload.append(valid_length + payload_bytes)
-
-    s_group(values=length_and_payload, name="LengthAndPayload")
+    s_group(values=all_blobs, name="oneshot_capsule_corpus")
 
     return s_get(session_name)
 
