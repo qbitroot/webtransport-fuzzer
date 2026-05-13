@@ -3,8 +3,6 @@ from boofuzz import (
     s_group,
     s_static,
     s_get,
-    s_random,
-    s_byte,
     s_block,
     s_dword,
     s_string,
@@ -349,17 +347,27 @@ def _build_tier_a_simple_varint_capsule(name: str, type_bytes: bytes):
 
 
 def _build_tier_a_drain_session():
-    """Build the WT_DRAIN_SESSION sub-Request (empty payload per spec)."""
-    from src.quic_varint_fuzzable import s_quic_varint
-
+    """WT_DRAIN_SESSION (0x78AE) sub-Request — empty payload, fuzzed Length."""
     name = "__tier_a_drain_session"
     _reset_request(name)
     s_initialize(name)
     s_static(CAPSULE_DRAIN_SESSION, name="drain_type")
+    from src.quic_varint_fuzzable import s_quic_varint
+
     s_quic_varint(name="drain_len", block_name="drain_payload")
     with s_block("drain_payload"):
         s_static(b"", name="drain_payload_empty")
     return s_get(name)
+
+
+_TIER_A_SIMPLE_VARINT_CAPSULES = [
+    ("max_data", CAPSULE_MAX_DATA),
+    ("max_streams_bidi", CAPSULE_MAX_STREAMS_BIDI),
+    ("max_streams_uni", CAPSULE_MAX_STREAMS_UNI),
+    ("data_blocked", CAPSULE_DATA_BLOCKED),
+    ("streams_blocked_bidi", CAPSULE_STREAMS_BLOCKED_BIDI),
+    ("streams_blocked_uni", CAPSULE_STREAMS_BLOCKED_UNI),
+]
 
 
 def _build_tier_a_blobs() -> list:
@@ -367,66 +375,26 @@ def _build_tier_a_blobs() -> list:
     Materialise every Tier-A spec-aware sub-Request into a deduplicated
     list of fully-rendered byte sequences.
 
-    This is necessary because boofuzz lacks native switch/case semantics
-    at the top-level Request: ``s_block(group=...)`` iterates but does
-    not gate rendering, and ``s_block(dep=...)`` gates rendering but
-    only triggers a single render-pass per group-value. Combining both
-    leaves branch-internal mutations un-paired with the selector.
-
-    Workaround: define each branch as its own sub-Request, exhaust its
-    mutation generator, dedup, and union the resulting bytes into the
-    top-level oneshot ``s_group`` together with the Tier-B raw blobs.
-
-    The advantages of native boofuzz primitives — ``s_dword`` boundary
-    cases, ``s_string`` SPIKE-derived mutations (format strings, oversize
-    buffers, UTF-8 boundaries), and the ``QuicVarInt`` sizer's spec-aware
-    integer + malformed-byte mutation pool — are preserved by this
-    approach because the sub-Requests run those primitives during
-    enumeration. Only the runtime laziness of mutation generation is
-    given up; this is acceptable because the corpus is built once at
-    fuzz-session start.
+    Boofuzz lacks native switch/case semantics at the top-level Request
+    (``s_block(group=...)`` iterates but does not gate rendering;
+    ``s_block(dep=...)`` gates but does not pair with branch-internal
+    mutations). Workaround: define each branch as its own sub-Request,
+    exhaust its mutation generator, dedup, and union the resulting bytes
+    into the top-level oneshot ``s_group`` together with the Tier-B raw
+    blobs. This preserves ``s_dword`` boundaries, ``s_string`` SPIKE
+    mutations, and the ``QuicVarInt`` mutation pool; only runtime
+    laziness is sacrificed (acceptable: corpus is built once).
     """
+    branch_builders = [
+        _build_tier_a_close_session,
+        _build_tier_a_drain_session,
+    ] + [
+        (lambda n=n, t=t: _build_tier_a_simple_varint_capsule(n, t))
+        for n, t in _TIER_A_SIMPLE_VARINT_CAPSULES
+    ]
     blobs = []
-    blobs.extend(_enumerate_request_renders(_build_tier_a_close_session()))
-    blobs.extend(_enumerate_request_renders(_build_tier_a_drain_session()))
-    blobs.extend(
-        _enumerate_request_renders(
-            _build_tier_a_simple_varint_capsule("max_data", CAPSULE_MAX_DATA)
-        )
-    )
-    blobs.extend(
-        _enumerate_request_renders(
-            _build_tier_a_simple_varint_capsule(
-                "max_streams_bidi", CAPSULE_MAX_STREAMS_BIDI
-            )
-        )
-    )
-    blobs.extend(
-        _enumerate_request_renders(
-            _build_tier_a_simple_varint_capsule(
-                "max_streams_uni", CAPSULE_MAX_STREAMS_UNI
-            )
-        )
-    )
-    blobs.extend(
-        _enumerate_request_renders(
-            _build_tier_a_simple_varint_capsule("data_blocked", CAPSULE_DATA_BLOCKED)
-        )
-    )
-    blobs.extend(
-        _enumerate_request_renders(
-            _build_tier_a_simple_varint_capsule(
-                "streams_blocked_bidi", CAPSULE_STREAMS_BLOCKED_BIDI
-            )
-        )
-    )
-    blobs.extend(
-        _enumerate_request_renders(
-            _build_tier_a_simple_varint_capsule(
-                "streams_blocked_uni", CAPSULE_STREAMS_BLOCKED_UNI
-            )
-        )
-    )
+    for build in branch_builders:
+        blobs.extend(_enumerate_request_renders(build()))
     return list(dict.fromkeys(blobs))
 
 
@@ -487,72 +455,42 @@ def define_oneshot_capsule(session_name="wt_oneshot"):
 # =============================================================================
 
 
-def build_close_session(error_code: int = 0, message: str = "") -> bytes:
-    """
-    Build a valid CLOSE_WEBTRANSPORT_SESSION capsule (0x2843).
+def _wrap(capsule_type: bytes, payload: bytes) -> bytes:
+    """[Type][Length(VarInt)][Payload] — the capsule framing of RFC 9297 §3.2."""
+    return capsule_type + encode_quic_varint(len(payload)) + payload
 
-    Payload: [Application Error Code (32-bit BE)][Error Message (UTF-8, max 1024)]
-    """
-    msg_bytes = message.encode("utf-8")[:1024]
-    payload = struct.pack(">I", error_code) + msg_bytes
-    return CAPSULE_CLOSE_SESSION + encode_quic_varint(len(payload)) + payload
+
+def build_close_session(error_code: int = 0, message: str = "") -> bytes:
+    """WT_CLOSE_SESSION (0x2843): [u32 BE app error][UTF-8 message ≤ 1024B]."""
+    payload = struct.pack(">I", error_code) + message.encode("utf-8")[:1024]
+    return _wrap(CAPSULE_CLOSE_SESSION, payload)
 
 
 def build_drain_session() -> bytes:
-    """
-    Build a valid DRAIN_WEBTRANSPORT_SESSION capsule (0x78AE).
-
-    Payload: empty (Length = 0).
-    """
+    """WT_DRAIN_SESSION (0x78AE): empty payload."""
     return CAPSULE_DRAIN_SESSION + b"\x00"
 
 
 def build_max_data(limit: int) -> bytes:
-    """
-    Build a WT_MAX_DATA capsule (0x190B4D3D).
-
-    Payload: [Maximum Data (VarInt)]
-    """
-    payload = encode_quic_varint(limit)
-    return CAPSULE_MAX_DATA + encode_quic_varint(len(payload)) + payload
+    """WT_MAX_DATA (0x190B4D3D): single VarInt payload."""
+    return _wrap(CAPSULE_MAX_DATA, encode_quic_varint(limit))
 
 
 def build_max_streams(limit: int, bidi: bool = True) -> bytes:
-    """
-    Build a WT_MAX_STREAMS capsule.
-
-    bidi=True  -> 0x190B4D3F (bidirectional)
-    bidi=False -> 0x190B4D40 (unidirectional)
-
-    Payload: [Maximum Streams (VarInt)]
-    """
+    """WT_MAX_STREAMS bidi (0x190B4D3F) / uni (0x190B4D40): single VarInt payload."""
     capsule_type = CAPSULE_MAX_STREAMS_BIDI if bidi else CAPSULE_MAX_STREAMS_UNI
-    payload = encode_quic_varint(limit)
-    return capsule_type + encode_quic_varint(len(payload)) + payload
+    return _wrap(capsule_type, encode_quic_varint(limit))
 
 
 def build_data_blocked(limit: int) -> bytes:
-    """
-    Build a WT_DATA_BLOCKED capsule (0x190B4D41).
-
-    Payload: [Maximum Data (VarInt)] — the limit at which blocking occurred.
-    """
-    payload = encode_quic_varint(limit)
-    return CAPSULE_DATA_BLOCKED + encode_quic_varint(len(payload)) + payload
+    """WT_DATA_BLOCKED (0x190B4D41): single VarInt payload (blocking limit)."""
+    return _wrap(CAPSULE_DATA_BLOCKED, encode_quic_varint(limit))
 
 
 def build_streams_blocked(limit: int, bidi: bool = True) -> bytes:
-    """
-    Build a WT_STREAMS_BLOCKED capsule.
-
-    bidi=True  -> 0x190B4D43 (bidirectional)
-    bidi=False -> 0x190B4D44 (unidirectional)
-
-    Payload: [Maximum Streams (VarInt)] — the limit at which blocking occurred.
-    """
+    """WT_STREAMS_BLOCKED bidi (0x190B4D43) / uni (0x190B4D44): single VarInt."""
     capsule_type = CAPSULE_STREAMS_BLOCKED_BIDI if bidi else CAPSULE_STREAMS_BLOCKED_UNI
-    payload = encode_quic_varint(limit)
-    return capsule_type + encode_quic_varint(len(payload)) + payload
+    return _wrap(capsule_type, encode_quic_varint(limit))
 
 
 # =============================================================================
@@ -710,29 +648,15 @@ def _build_lastfuzz_capsules() -> list:
     DEFAULT_LENGTH_PAYLOAD = b"\x00"  # VarInt length=0, empty body
     DEFAULT_TYPE = b"\x00"  # Type 0 (unknown, must be ignored per RFC 9297)
 
-    blobs = []
-
-    # Axis 1: fuzz type, neutral length+payload
-    for capsule_type in ALL_INTERESTING_BYTES:
-        blobs.append(capsule_type + DEFAULT_LENGTH_PAYLOAD)
-
-    # Axis 2: fuzz length+payload, neutral type
-    # Without body: length is fuzzed, body is empty
-    for length_bytes in ALL_INTERESTING_BYTES:
-        blobs.append(DEFAULT_TYPE + length_bytes)
-    # With body: length is valid, body is an interesting payload
-    for payload_bytes in ALL_INTERESTING_BYTES:
-        valid_length = encode_quic_varint(len(payload_bytes))
-        blobs.append(DEFAULT_TYPE + valid_length + payload_bytes)
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for b in blobs:
-        if b not in seen:
-            seen.add(b)
-            unique.append(b)
-    return unique
+    blobs = [t + DEFAULT_LENGTH_PAYLOAD for t in ALL_INTERESTING_BYTES]
+    # Axis 2 — fuzz length+payload, neutral type. Both with empty body
+    # (length itself fuzzed) and with valid length covering an
+    # interesting payload, sharing the same neutral type prefix.
+    blobs += [DEFAULT_TYPE + lb for lb in ALL_INTERESTING_BYTES]
+    blobs += [
+        DEFAULT_TYPE + encode_quic_varint(len(p)) + p for p in ALL_INTERESTING_BYTES
+    ]
+    return list(dict.fromkeys(blobs))
 
 
 def define_scenario_lastfuzz(session_name="wt_scenario_lastfuzz"):
@@ -759,75 +683,26 @@ def define_scenario_lastfuzz(session_name="wt_scenario_lastfuzz"):
     for _name, scenario in scenarios.items():
         prefix = scenario[:-1] if len(scenario) > 1 else []
         for blob in fuzz_blobs:
-            mutated = prefix + [step_capsule(blob)]
-            all_encoded.append(encode_scenario(mutated))
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for m in all_encoded:
-        if m not in seen:
-            seen.add(m)
-            unique.append(m)
+            all_encoded.append(encode_scenario(prefix + [step_capsule(blob)]))
 
     s_initialize(session_name)
-    s_group(values=unique, name="ScenarioLastFuzz")
-
+    s_group(values=list(dict.fromkeys(all_encoded)), name="ScenarioLastFuzz")
     return s_get(session_name)
 
 
 def _build_oneshot_as_scenarios() -> list:
     """
-    Re-encode every oneshot capsule test case as a single-step scenario.
+    Re-encode every oneshot capsule blob as a single-step scenario so it
+    can share the scenario-encoded ``s_group`` used by ``define_all``.
 
-    This allows oneshot blobs to be mixed into a unified s_group that
-    uses send_mode="scenario", keeping the 'all' mode executor uniform.
-
-    Mirrors define_oneshot_capsule() exactly: the two s_group axes are
-    iterated in lockstep with each axis held at its default while the
-    other varies, and the compound blob [type + length_and_payload] is
-    what gets sent.
-
-      Axis 1 — type varies, LengthAndPayload fixed at default (first value):
-                [FuzzedType][DefaultLAP]
-
-      Axis 2 — type fixed at default (first value), LengthAndPayload varies:
-                [DefaultType][FuzzedLAP]
-
-    The seed case (both defaults) is included as well.
+    The blob set is exactly the union ``define_oneshot_capsule`` builds
+    (Tier A + Tier B), keeping a single source of truth for the oneshot
+    corpus.
     """
     from src.sequence_mutator import step_capsule, encode_scenario
 
-    # Build the LengthAndPayload list exactly as define_oneshot_capsule does
-    length_and_payload = []
-    for length_bytes in ALL_INTERESTING_BYTES:
-        length_and_payload.append(length_bytes + b"")
-    for payload_bytes in ALL_INTERESTING_BYTES:
-        valid_length = encode_quic_varint(len(payload_bytes))
-        length_and_payload.append(valid_length + payload_bytes)
-    unique_lap = list(dict.fromkeys(length_and_payload))
-
-    default_type = ALL_INTERESTING_BYTES[0]
-    default_lap = unique_lap[0]
-
-    blobs = []
-    # Seed: both axes at default
-    blobs.append(default_type + default_lap)
-    # Axis 1: type varies, LAP held at default
-    for capsule_type in ALL_INTERESTING_BYTES[1:]:
-        blobs.append(capsule_type + default_lap)
-    # Axis 2: LAP varies, type held at default
-    for lap in unique_lap[1:]:
-        blobs.append(default_type + lap)
-
-    # Deduplicate while preserving order, then wrap each as a 1-step scenario
-    seen = set()
-    unique = []
-    for b in blobs:
-        if b not in seen:
-            seen.add(b)
-            unique.append(encode_scenario([step_capsule(b)]))
-    return unique
+    blobs = list(dict.fromkeys(_build_tier_a_blobs() + _build_raw_fuzz_blobs()))
+    return [encode_scenario([step_capsule(b)]) for b in blobs]
 
 
 def define_all(session_name="wt_all"):
@@ -865,17 +740,8 @@ def define_all(session_name="wt_all"):
         for blob in fuzz_blobs:
             all_values.append(encode_scenario(prefix + [step_capsule(blob)]))
 
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for m in all_values:
-        if m not in seen:
-            seen.add(m)
-            unique.append(m)
-
     s_initialize(session_name)
-    s_group(values=unique, name="AllModes")
-
+    s_group(values=list(dict.fromkeys(all_values)), name="AllModes")
     return s_get(session_name)
 
 
@@ -896,20 +762,10 @@ def define_multistep(session_name="wt_multistep"):
 
     scenarios = _build_multistep_scenarios()
     all_mutations = []
-
     for _name, scenario in scenarios.items():
         for mutation in generate_sequence_mutations(scenario):
             all_mutations.append(encode_scenario(mutation))
 
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for m in all_mutations:
-        if m not in seen:
-            seen.add(m)
-            unique.append(m)
-
     s_initialize(session_name)
-    s_group(values=unique, name="ScenarioSequence")
-
+    s_group(values=list(dict.fromkeys(all_mutations)), name="ScenarioSequence")
     return s_get(session_name)

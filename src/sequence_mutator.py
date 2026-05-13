@@ -78,7 +78,12 @@ def _build_prohibited_capsules() -> List[Tuple[str, bytes]]:
 
 PROHIBITED_CAPSULES = _build_prohibited_capsules()
 
-MAX_PERMUTATIONS = 120  # 5! = 120
+MAX_PERMUTATIONS = 5040  # 7! = 5040 — exhaust all permutations of current
+# scenarios (longest = kitchen_sink, 6 steps, 720 perms) with headroom for any
+# future 7-step scenario before truncation kicks in. Truncation matters because
+# permutation order is *the* fuzzer signal for scenarios: clipping at 5! masks
+# state-confusion bugs that only manifest under specific late-position step
+# orderings (e.g. capsule-after-multiple-data interactions in kitchen_sink).
 
 
 def _step_key(step: dict) -> bytes:
