@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+WebTransport Protocol Fuzzer — CLI entry point.
+
+Wires up:
+  * A boofuzz ``Session`` with ``reuse_target_connection=False`` so each
+    test case runs on a fresh QUIC handshake (one-shot crash isolation).
+  * The ``WebTransportConnection`` target connection.
+  * Monitors: ``EchoCompareMonitor`` (per-step echo logging) and
+    ``RequestLogger`` (SQLite test-case recorder).
+
+Liveness is not probed actively after each test case; the next
+``connection.open()`` is the implicit health check. If the server is
+down, the open call raises ``ConnectionError``, boofuzz catches it, and
+the run continues / aborts based on its own retry policy.
+"""
 
 import argparse
 import logging
@@ -8,218 +23,210 @@ import time
 
 from boofuzz import Session, Target
 
-from src.fuzzer_connection import WebTransportConnection
-from src.echo_monitor import EchoCompareMonitor, ServerDownError
 from src.boofuzz_definitions import (
-    define_oneshot_capsule,
-    define_multistep,
-    define_scenario_lastfuzz,
     define_all,
+    define_multistep,
+    define_oneshot_capsule,
+    define_scenario_lastfuzz,
+)
+from src.echo_monitor import EchoCompareMonitor
+from src.fuzzer_connection import (
+    SEND_MODE_CAPSULE,
+    SEND_MODE_SCENARIO,
+    WebTransportConnection,
 )
 
-# ---- Logging setup ----
 LOG_FMT = "%(asctime)s [%(levelname)5s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger("wt_fuzzer")
 logging.getLogger("tornado.access").setLevel(logging.WARNING)
 
-# ---- Helper: ensure failure dir exists ----
-FAILURES_DIR = "failures"
-os.makedirs(FAILURES_DIR, exist_ok=True)
+os.makedirs("failures", exist_ok=True)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="WebTransport Protocol Fuzzer")
-    parser.add_argument("--url", default="https://0.0.0.0:6161/echo", help="Target URL")
-    parser.add_argument(
+_MODE_DESCRIPTIONS = {
+    "oneshot": "One-shot (single malformed capsule per connection)",
+    "multistep": "Multistep (data streams + capsule sequences)",
+    "scenario-lastfuzz": "Scenario-LastFuzz (scenario + fuzzed last step)",
+    "all": "All modes combined (oneshot + multistep + lastfuzz)",
+}
+
+
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="WebTransport Protocol Fuzzer")
+    p.add_argument("--url", default="https://0.0.0.0:6161/echo", help="Target URL")
+    p.add_argument(
         "--no-fuzz",
         action="store_true",
-        help="Run in validation mode (health check only)",
+        help="Validation mode: open one connection, send a bidi echo probe, exit.",
     )
-    parser.add_argument(
+    p.add_argument(
         "--mode",
-        choices=["oneshot", "multistep", "scenario-lastfuzz", "all"],
+        choices=list(_MODE_DESCRIPTIONS),
         default="oneshot",
-        help="Fuzzing mode: oneshot (single malformed capsule), "
-        "multistep (scenarios with interleaved data streams + capsules), "
-        "scenario-lastfuzz (scenarios in original order, last step replaced "
-        "with fuzzed capsule), "
-        "all (oneshot + multistep + scenario-lastfuzz combined) "
-        "(default: oneshot)",
+        help="Fuzzing mode (default: oneshot).",
     )
-    parser.add_argument(
-        "--no-healthcheck",
+    p.add_argument(
+        "--no-echo-monitor",
         action="store_true",
-        help="Disable health checks after each test case",
+        help="Skip the EchoCompareMonitor; only the SQLite RequestLogger runs.",
     )
-    parser.add_argument(
-        "--start-index",
-        type=int,
-        default=1,
-        help="Start fuzzing from this test case index",
+    p.add_argument(
+        "--fail-on-echo-mismatch",
+        action="store_true",
+        help="Treat any echo mismatch as a boofuzz failure (default: log only).",
     )
-    parser.add_argument(
-        "--end-index", type=int, help="Stop fuzzing after this test case index"
-    )
-    parser.add_argument(
+    p.add_argument("--start-index", type=int, default=1)
+    p.add_argument("--end-index", type=int)
+    p.add_argument(
         "--server-cmd",
         type=str,
         default=None,
-        help="Shell command to launch the target server as a subprocess. "
-        "Redirect its stdout to a log file for later analysis with analyze_logs.py, e.g.: "
-        "'python server.py cert.pem key.pem 2>/dev/null | tee server.log'",
+        help="Optional shell command to launch the target server as a subprocess.",
     )
-    parser.add_argument(
-        "--server-startup-delay",
-        type=float,
-        default=1.0,
-        help="Seconds to wait after launching server before fuzzing (default: 1.0)",
-    )
-    parser.add_argument(
+    p.add_argument("--server-startup-delay", type=float, default=1.0)
+    p.add_argument(
         "--db",
         type=str,
         default=None,
-        help="Path to the SQLite log database. Defaults to boofuzz-results/run_<timestamp>.db",
+        help="Path to the SQLite log DB (default: boofuzz-results/run_<timestamp>.db).",
     )
-    args = parser.parse_args()
+    return p
 
-    target_url = args.url
 
-    mode_desc = {
-        "oneshot": "One-Shot (single malformed capsule per connection)",
-        "multistep": "Multistep (data streams + capsule sequences)",
-        "scenario-lastfuzz": "Scenario-LastFuzz (scenario + fuzzed last step)",
-        "all": "All modes combined (oneshot + multistep + lastfuzz)",
-    }
-
+def _print_banner(mode: str) -> None:
     print(
         f"""
     ╔═══════════════════════════════════════════════════════╗
     ║   WebTransport Protocol Fuzzer                         ║
-    ║   Target: WebTransport over HTTP/3 Framing             ║
-    ║   Mode: {mode_desc[args.mode]:<47s}║
+    ║   Target: WebTransport over HTTP/3                     ║
+    ║   Mode: {_MODE_DESCRIPTIONS[mode]:<47s}║
     ╚═══════════════════════════════════════════════════════╝
     """
     )
-    logger.info("Target: %s", target_url)
-    logger.info("Mode: %s", args.mode)
 
-    # ---- Server subprocess management ----
+
+def _run_validation(url: str) -> int:
+    """Open one connection, send a bidi echo probe, report the result."""
+    logger.info("Validation mode: probing %s", url)
+    conn = WebTransportConnection(url, timeout=3.0)
+    try:
+        conn.open()
+    except Exception:
+        logger.exception("Validation failed: could not open connection")
+        return 1
+
+    try:
+        loop = conn._loop
+        assert loop is not None and conn._protocol is not None
+        probe = b"HEALTHCHECK"
+        _sid, response = loop.run_until_complete(
+            conn._protocol.send_bidirectional_stream(probe, timeout=2.0)
+        )
+        if response == probe:
+            logger.info("Validation SUCCESS: bidi echo round-trip OK")
+            return 0
+        logger.error(
+            "Validation FAILED: bidi echo mismatch (sent %r, got %r)",
+            probe,
+            response,
+        )
+        return 1
+    finally:
+        conn.close()
+
+
+def main() -> int:
+    args = _build_argparser().parse_args()
+    _print_banner(args.mode)
+    logger.info("Target: %s", args.url)
+
     server_manager = None
-
     if args.server_cmd:
         from src.server_manager import ServerManager
 
         server_manager = ServerManager(
-            cmd=args.server_cmd,
-            startup_delay=args.server_startup_delay,
+            cmd=args.server_cmd, startup_delay=args.server_startup_delay
         )
         server_manager.start()
 
-    if args.no_fuzz:
-        logger.info("Running in VALIDATION MODE (--no-fuzz)")
-        connection = WebTransportConnection(target_url, timeout=3.0)
+    try:
+        if args.no_fuzz:
+            return _run_validation(args.url)
+        return _run_fuzz(args)
+    finally:
+        if server_manager is not None:
+            server_manager.stop()
 
-        try:
-            connection.open()
 
-            logger.info("Sending Health Check (Standard Probe)...")
-            success = connection.send_health_check()
+def _run_fuzz(args: argparse.Namespace) -> int:
+    from src.log_db import LogDB
+    from src.request_logger import RequestLogger
 
-            if success:
-                logger.info("Validation SUCCESS: Server responded to health check.")
-            else:
-                logger.error(
-                    "Validation FAILED: Server did not respond to health check."
-                )
+    os.makedirs("boofuzz-results", exist_ok=True)
+    db_path = args.db or os.path.join("boofuzz-results", f"run_{int(time.time())}.db")
+    log_db = LogDB(db_path)
+    logger.info("Log database: %s", db_path)
 
-            connection.close()
-        except Exception:
-            logger.exception("Validation encountered an error")
+    if args.mode == "oneshot":
+        send_mode = SEND_MODE_CAPSULE
+        msg = define_oneshot_capsule(session_name="wt_oneshot")
+    elif args.mode == "multistep":
+        send_mode = SEND_MODE_SCENARIO
+        msg = define_multistep(session_name="wt_multistep")
+    elif args.mode == "scenario-lastfuzz":
+        send_mode = SEND_MODE_SCENARIO
+        msg = define_scenario_lastfuzz(session_name="wt_scenario_lastfuzz")
+    elif args.mode == "all":
+        send_mode = SEND_MODE_SCENARIO
+        msg = define_all(session_name="wt_all")
+    else:  # pragma: no cover — argparse already validates
+        logger.error("Unknown mode: %s", args.mode)
+        return 1
 
-    else:
-        logger.info("Running in %s FUZZING MODE", args.mode.upper())
-        logger.info("Press Ctrl+C to stop")
+    connection = WebTransportConnection(args.url, timeout=3.0, send_mode=send_mode)
+    logger.info("Mode %s: %d test cases queued", args.mode, msg.num_mutations())
 
-        # ---- Log DB setup ----
-        from src.log_db import LogDB
-        from src.request_logger import RequestLogger
+    monitors = []
+    if not args.no_echo_monitor:
+        monitors.append(EchoCompareMonitor(fail_on_mismatch=args.fail_on_echo_mismatch))
+    monitors.append(RequestLogger(log_db))
 
-        os.makedirs("boofuzz-results", exist_ok=True)
-        log_db_path = args.db or os.path.join(
-            "boofuzz-results", f"run_{int(time.time())}.db"
+    session = Session(
+        target=Target(connection=connection, monitors=monitors),
+        fuzz_loggers=[],  # boofuzz's web GUI runs its own DB at :26000
+        db_filename=":memory:",
+        sleep_time=0.0,
+        restart_sleep_time=0,
+        reuse_target_connection=False,
+        index_start=args.start_index,
+        index_end=args.end_index,
+    )
+    session.connect(msg)
+
+    rc = 0
+    try:
+        session.fuzz()
+    except KeyboardInterrupt:
+        logger.info("Fuzzing stopped by user")
+    except EOFError:
+        # boofuzz's web GUI prompts for ENTER on shutdown; harmless under non-TTY.
+        pass
+    except (TimeoutError, ConnectionError, RuntimeError) as e:
+        logger.error("Fuzzing halted: %s", e)
+        rc = 1
+    except Exception:
+        logger.exception("Fuzzing encountered an unexpected error")
+        rc = 1
+    finally:
+        logger.info("Session finished. Log DB: %s", db_path)
+        logger.info(
+            "Use analyze_logs.py --log <server.log> --db %s to correlate server output.",
+            db_path,
         )
-        log_db = LogDB(log_db_path)
-        logger.info("Log database: %s", log_db_path)
-
-        # ---- Select send mode and boofuzz definition based on --mode ----
-        if args.mode == "oneshot":
-            send_mode = "capsule"
-            msg = define_oneshot_capsule(session_name="wt_oneshot")
-        elif args.mode == "multistep":
-            send_mode = "scenario"
-            msg = define_multistep(session_name="wt_multistep")
-        elif args.mode == "scenario-lastfuzz":
-            send_mode = "scenario"
-            msg = define_scenario_lastfuzz(session_name="wt_scenario_lastfuzz")
-        elif args.mode == "all":
-            send_mode = "scenario"
-            msg = define_all(session_name="wt_all")
-        else:
-            logger.error("Unknown mode: %s", args.mode)
-            sys.exit(1)
-
-        connection = WebTransportConnection(
-            target_url, timeout=3.0, send_mode=send_mode
-        )
-
-        # Log mutation count
-        num_mutations = msg.num_mutations()
-        logger.info("Mode %s: %d test cases to run", args.mode, num_mutations)
-
-        monitors = []
-        if not args.no_healthcheck:
-            monitors.append(EchoCompareMonitor(crash_on_mismatch=True))
-
-        monitors.append(RequestLogger(log_db))
-
-        target = Target(connection=connection, monitors=monitors)
-
-        session = Session(
-            target=target,
-            fuzz_loggers=[],  # Web GUI at :26000 handles its own DB
-            db_filename=":memory:",  # Don't write boofuzz's default run-*.db to disk
-            sleep_time=0.0,
-            restart_sleep_time=0,
-            reuse_target_connection=False,
-            index_start=args.start_index,
-            index_end=args.end_index,
-        )
-
-        session.connect(msg)
-
-        try:
-            session.fuzz()
-        except KeyboardInterrupt:
-            logger.info("Fuzzing stopped by user")
-        except ServerDownError as e:
-            logger.critical(f"Fuzzing ABORTED: {e}")
-            sys.exit(1)
-        except (TimeoutError, ConnectionError, RuntimeError) as e:
-            logger.error(f"Fuzzing halted: {e}")
-        except Exception:
-            logger.exception("Fuzzing encountered an unexpected error")
-        finally:
-            logger.info("Fuzzing session finished")
-            logger.info("Log database: %s", log_db_path)
-            logger.info(
-                "Run analyze_logs.py --log <server.log> --db %s to correlate server output.",
-                log_db_path,
-            )
-            log_db.close()
-            if server_manager:
-                server_manager.stop()
+        log_db.close()
+    return rc
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,27 +1,20 @@
 #!/usr/bin/env python3
 """
-analyze_logs.py — correlate a server WTFUZZ log file with a fuzzer run database.
+analyze_logs.py — correlate a WTFUZZ server log with a fuzzer run database.
 
-The server emits one WTFUZZ session per connection. The fuzzer sends one
-connection per test case, optionally followed by a health-check connection.
-This script groups the log into sessions by conn_idx, pairs them with
-test_cases rows by insertion order (test_cases.id), fills in log_group_id
-for fuzz rows, and inserts health-check rows.
+The fuzzer opens exactly one WebTransport session per test case. Inside
+that session it executes the test-case payload (capsule send or scenario
+steps) and an in-session bidi echo probe; both share the same conn_idx.
+
+This script groups the log into sessions by conn_idx, pairs them 1:1 with
+``test_cases`` rows by insertion order, and fills in ``log_group_id``.
 
 Usage:
     python analyze_logs.py --log server.log --db boofuzz-results/run_XYZ.db
-    python analyze_logs.py --log server.log --db run.db --no-healthcheck
 
-Pairing rule (default, health-check enabled):
-    server conn_idx 0 → fuzz   for test_cases.id 1
-    server conn_idx 1 → health-check row inserted after id 1
-    server conn_idx 2 → fuzz   for test_cases.id 2
-    server conn_idx 3 → health-check row inserted after id 2
-    ...
-
-With --no-healthcheck:
-    server conn_idx 0 → fuzz for test_cases.id 1
-    server conn_idx 1 → fuzz for test_cases.id 2
+Pairing rule:
+    conn_idx 0 ↔ test_cases.id 1
+    conn_idx 1 ↔ test_cases.id 2
     ...
 """
 
@@ -146,11 +139,6 @@ def main():
     )
     parser.add_argument("--log", required=True, help="Path to the server log file")
     parser.add_argument("--db", required=True, help="Path to the SQLite run database")
-    parser.add_argument(
-        "--no-healthcheck",
-        action="store_true",
-        help="Log was captured without health-check probes (1 session per fuzz request)",
-    )
     args = parser.parse_args()
 
     # ---- Parse server log ----
@@ -174,62 +162,30 @@ def main():
     logger.info("Opening database: %s", args.db)
     db = LogDB(args.db)
 
-    # ---- Load existing fuzz test case rows ----
-    test_cases = db.get_test_cases()
-    fuzz_cases = [tc for tc in test_cases if not tc["is_healthcheck"]]
+    fuzz_cases = db.get_test_cases()
     logger.info("Found %d fuzz test case(s) in database.", len(fuzz_cases))
 
-    # ---- Pair sessions to test cases ----
-    # sessions list is ordered by conn_idx.
-    # With healthcheck: even positions (0, 2, 4, ...) = fuzz; odd = healthcheck.
-    # Without healthcheck: every position = fuzz.
-
-    sessions_per_case = 1 if args.no_healthcheck else 2
+    # ---- Pair 1:1 by insertion order ----
+    # The fuzzer opens exactly one WebTransport session per test case
+    # (the in-session bidi health probe shares that session, see
+    # ``EchoCompareMonitor``), so sessions[i] ↔ fuzz_cases[i].
 
     matched = 0
-    inserted_hc = 0
-    unmatched_sessions = 0
-
+    unmatched = 0
     for case_num, tc in enumerate(fuzz_cases):
-        base = case_num * sessions_per_case
-
-        # Fuzz session
-        if base >= len(sessions):
+        if case_num >= len(sessions):
             logger.warning(
-                "test_cases.id=%d: no corresponding fuzz session in log (log may be truncated).",
+                "test_cases.id=%d: no corresponding session in log (log may be truncated).",
                 tc["id"],
             )
-            unmatched_sessions += 1
+            unmatched += 1
             continue
-
-        fuzz_session = sessions[base]
-        log_group_id = db._get_or_create_log_group(fuzz_session["lines"])
+        log_group_id = db._get_or_create_log_group(sessions[case_num]["lines"])
         db.set_log_group(tc["id"], log_group_id)
         matched += 1
 
-        # Health-check session
-        if not args.no_healthcheck:
-            hc_base = base + 1
-            if hc_base < len(sessions):
-                hc_session = sessions[hc_base]
-                hc_log_group_id = db._get_or_create_log_group(hc_session["lines"])
-                db.record_test_case(
-                    index=tc["test_index"],
-                    sent_steps=[],
-                    is_healthcheck=True,
-                    lines=hc_session["lines"],
-                )
-                inserted_hc += 1
-            else:
-                logger.warning(
-                    "test_cases.id=%d: no health-check session in log.",
-                    tc["id"],
-                )
-
-    # Warn about leftover sessions beyond what test cases account for
-    expected_sessions = len(fuzz_cases) * sessions_per_case
-    if len(sessions) > expected_sessions:
-        extra = len(sessions) - expected_sessions
+    if len(sessions) > len(fuzz_cases):
+        extra = len(sessions) - len(fuzz_cases)
         logger.warning(
             "%d extra session(s) in log beyond the %d test case(s) — "
             "was the server reused across runs?",
@@ -244,8 +200,7 @@ def main():
     print(f"  Fuzz test cases in DB : {len(fuzz_cases)}")
     print(f"  Sessions in log       : {len(sessions)}")
     print(f"  Matched               : {matched}")
-    print(f"  Health-check rows ins.: {inserted_hc}")
-    print(f"  Unmatched (truncated) : {unmatched_sessions}")
+    print(f"  Unmatched (truncated) : {unmatched}")
     print(f"  Sessions missing OPEN : {missing_open}")
     print(f"  Sessions missing CLOSE: {missing_close}")
     print()

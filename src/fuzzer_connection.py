@@ -113,6 +113,8 @@ class WebTransportConnection(ITargetConnection):
         self.last_sent_steps: List[Step] = []
         self.last_step_outcomes: List[StepOutcome] = []
         self.last_send_error: Optional[BaseException] = None
+        # Result of the in-session post-fuzz health probe (None until run).
+        self.last_health_check: Optional[StepOutcome] = None
 
     @property
     def info(self) -> str:
@@ -200,6 +202,7 @@ class WebTransportConnection(ITargetConnection):
         self.last_sent_steps = []
         self.last_step_outcomes = []
         self.last_send_error = None
+        self.last_health_check = None
 
         try:
             if self._send_mode == SEND_MODE_CAPSULE:
@@ -223,6 +226,38 @@ class WebTransportConnection(ITargetConnection):
         via ``last_step_outcomes`` rather than the boofuzz recv channel.
         """
         return b""
+
+    # -- in-session health probe ----------------------------------------------------
+
+    _HEALTH_PROBE_BYTES = b"HEALTHCHECK"
+
+    def health_check(self, timeout: float = 1.0) -> StepOutcome:
+        """
+        Send a bidi echo probe on the still-open session and report the result.
+
+        Called by ``EchoCompareMonitor.post_send`` between the fuzz step(s)
+        and ``close()``. Detects servers that accepted the malformed input
+        without crashing but whose echo path is now broken (silent
+        corruption). The result is stored on ``last_health_check`` so the
+        monitor can decide whether to fail the test case.
+        """
+        outcome = StepOutcome()
+        if not self._loop or not self._protocol:
+            outcome.error = "connection not open"
+            self.last_health_check = outcome
+            return outcome
+        try:
+            _sid, response = self._loop.run_until_complete(
+                self._protocol.send_bidirectional_stream(
+                    self._HEALTH_PROBE_BYTES, timeout=timeout
+                )
+            )
+            outcome.echo_received = response
+            outcome.echo_match = response == self._HEALTH_PROBE_BYTES
+        except Exception as e:
+            outcome.error = repr(e)
+        self.last_health_check = outcome
+        return outcome
 
     # -- send-mode implementations --------------------------------------------------
 
