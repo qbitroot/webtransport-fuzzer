@@ -6,36 +6,32 @@ Targets the capsule layer on the CONNECT stream and data transports (bidirection
 
 - **`server/aioquic`** — Python echo server using [aioquic](https://github.com/aiortc/aioquic) (draft-03 / GEN1)
 - **`server/wtransport`** — Rust echo server using [wtransport](https://github.com/BiagioFesta/wtransport) (draft-09 / GEN3)
-- **`server/webtransport-go`** — Go echo server using [webtransport-go](https://github.com/quic-go/webtransport-go) (HTTP/3 over QUIC, self-signed TLS, listens on `0.0.0.0:6161`)
+- **`server/webtransport-go`** — Go echo server using [webtransport-go](https://github.com/quic-go/webtransport-go) (HTTP/3 over QUIC, self-signed TLS, listens on `0.0.0.0:6002`)
 
 ---
 
 ## Quick start
 
 ```bash
-# Validate connection
-uv run python main.py --no-fuzz --url https://127.0.0.1:6161/echo
+# Validate connection (aioquic default port)
+uv run python main.py --no-fuzz --url https://127.0.0.1:6000/echo
 
-# One-shot capsule fuzzer (single malformed capsule per connection)
-uv run python main.py --mode oneshot --url https://127.0.0.1:6161/echo
+# One-shot capsule fuzzer against aioquic (port 6000, web UI :26000)
+uv run launch.py run aioquic oneshot
 
-# Sc-shuffle (step-reordering mutations on named scenarios)
-uv run python main.py --mode sc-shuffle --url https://127.0.0.1:6161/echo
+# Sc-shuffle against wtransport (port 6001, web UI :26001)
+uv run launch.py run wtransport sc-shuffle
 
-# Sc-capsule (malformed capsule injected at last step of each scenario)
-uv run python main.py --mode sc-capsule --url https://127.0.0.1:6161/echo
+# Sc-capsule against go server (port 6002, web UI :26002)
+uv run launch.py run go sc-capsule
 
 # All modes combined in a single run
-uv run python main.py --mode all --url https://127.0.0.1:6161/echo
-
-# With server subprocess management
-uv run python main.py --mode sc-shuffle --url https://127.0.0.1:6161/echo \
-    --server-cmd "uv run server/aioquic/server.py cert.pem key.pem 2>&1 | tee server.log"
+uv run python main.py --mode all --url https://127.0.0.1:6000/echo
 
 # Resume from a specific test case index
 uv run python main.py --mode sc-shuffle --start-index 42 --end-index 100
 
-# boofuzz web UI available at http://localhost:26000 during a run
+# boofuzz web UI: aioquic=:26000  wtransport=:26001  go=:26002
 ```
 
 ---
@@ -226,5 +222,5 @@ server/
 
 - Use `uv run` for all commands (manages the venv).
 - TLS verification is disabled by default (self-signed certs). Use `--no-verify` with `get-server-version.py`.
-- To test from a browser: install mkcert and launch Chrome with `--origin-to-force-quic-on=127.0.0.1:6161`. Chrome does not support [localhost TLS for HTTP/3](https://news.ycombinator.com/item?id=41748640).
-- The boofuzz web UI is available at `http://localhost:26000` during a run.
+- To test from a browser: install mkcert and launch Chrome with `--origin-to-force-quic-on=127.0.0.1:6000`. Chrome does not support [localhost TLS for HTTP/3](https://news.ycombinator.com/item?id=41748640).
+- The boofuzz web UI ports: aioquic=26000, wtransport=26001, go=26002 (set per server in `launch.py`).

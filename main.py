@@ -70,7 +70,7 @@ _MODE_DESCRIPTIONS = {
 
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="WebTransport Protocol Fuzzer")
-    p.add_argument("--url", default="https://0.0.0.0:6161/echo", help="Target URL")
+    p.add_argument("--url", default="https://0.0.0.0:6000/echo", help="Target URL")
     p.add_argument(
         "--no-fuzz",
         action="store_true",
@@ -100,12 +100,24 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Optional shell command to launch the target server as a subprocess.",
     )
-    p.add_argument("--server-startup-delay", type=float, default=1.0)
+    p.add_argument("--server-startup-delay", type=float, default=30.0)
+    p.add_argument(
+        "--server-log",
+        type=str,
+        default=None,
+        help="Path to the server log file (enables readiness detection via SERVER_READY).",
+    )
     p.add_argument(
         "--db",
         type=str,
         default=None,
         help="Path to the SQLite log DB (default: boofuzz-results/run_<timestamp>.db).",
+    )
+    p.add_argument(
+        "--web-port",
+        type=int,
+        default=26000,
+        help="Port for the boofuzz web UI (default: 26000).",
     )
     p.add_argument(
         "-v",
@@ -169,7 +181,9 @@ def main() -> int:
         from src.server_manager import ServerManager
 
         server_manager = ServerManager(
-            cmd=args.server_cmd, startup_delay=args.server_startup_delay
+            cmd=args.server_cmd,
+            startup_delay=args.server_startup_delay,
+            log_file=args.server_log,
         )
         server_manager.start()
 
@@ -219,8 +233,9 @@ def _run_fuzz(args: argparse.Namespace) -> int:
 
     session = Session(
         target=Target(connection=connection, monitors=monitors),
-        fuzz_loggers=[],  # boofuzz's web GUI runs its own DB at :26000
+        fuzz_loggers=[],
         db_filename=":memory:",
+        web_port=args.web_port,
         sleep_time=0.0,
         restart_sleep_time=0,
         reuse_target_connection=False,

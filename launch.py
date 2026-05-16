@@ -7,10 +7,15 @@ Each run produces three files in ./logs/ with a shared stem:
     <server>_<mode>_<timestamp>.server.log  — server stdout/stderr
     <server>_<mode>_<timestamp>.report.txt  — analyze_logs output
 
+Server ports (fixed per implementation):
+    aioquic    — server :6000   web UI :26000
+    wtransport — server :6001   web UI :26001
+    go         — server :6002   web UI :26002
+
 Usage examples:
     uv run launch.py run aioquic oneshot
     uv run launch.py run wtransport sc-shuffle --no-echo-monitor
-    uv run launch.py run go sc-capsule --url https://localhost:4433/echo
+    uv run launch.py run go sc-capsule
     uv run launch.py run aioquic oneshot --start-index 500
     uv run launch.py analyze aioquic oneshot
     uv run launch.py analyze aioquic oneshot --stem aioquic_oneshot_20260516_120000
@@ -41,17 +46,23 @@ SERVERS = {
             " {root}/server/aioquic/cert.pem"
             " {root}/server/aioquic/key.pem"
         ),
-        "url": "https://0.0.0.0:6161/echo",
+        "port": 6000,
+        "web_port": 26000,
+        "path": "/echo",
         "startup_delay": 1.5,
     },
     "wtransport": {
-        "cmd": "cargo run --manifest-path {root}/server/wtransport/Cargo.toml --release --quiet",
-        "url": "https://0.0.0.0:4433/echo",
-        "startup_delay": 3.0,
+        "cmd": "cargo run --manifest-path {root}/server/wtransport/Cargo.toml --release --quiet --",
+        "port": 6001,
+        "web_port": 26001,
+        "path": "/echo",
+        "startup_delay": 60.0,
     },
     "go": {
         "cmd": "{root}/server/webtransport-go/webtransport-go-server",
-        "url": "https://0.0.0.0:4433/echo",
+        "port": 6002,
+        "web_port": 26002,
+        "path": "/echo",
         "startup_delay": 1.0,
     },
 }
@@ -95,16 +106,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     server_cfg = SERVERS[args.server]
     LOGS_DIR.mkdir(exist_ok=True)
 
+    port = server_cfg["port"]
+    web_port = server_cfg["web_port"]
+    url = args.url or f"https://0.0.0.0:{port}{server_cfg['path']}"
+    startup_delay = args.startup_delay or server_cfg["startup_delay"]
+
     stem = _stem(args.server, args.mode, _timestamp())
     db_path = LOGS_DIR / f"{stem}.db"
     server_log = LOGS_DIR / f"{stem}.server.log"
 
-    url = args.url or server_cfg["url"]
-    startup_delay = args.startup_delay or server_cfg["startup_delay"]
-
-    # Redirect server output to the log file.
-    # With -v: tee to both file and terminal.  Without: file only (quiet).
-    base_cmd = _server_cmd(args.server)
+    # Build server command with the configured port.
+    base_cmd = f"{_server_cmd(args.server)} --port {port}"
     if args.verbose:
         server_cmd = f"{base_cmd} 2>&1 | tee {server_log}"
     else:
@@ -122,8 +134,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         str(db_path),
         "--server-cmd",
         server_cmd,
+        "--server-log",
+        str(server_log),
         "--server-startup-delay",
         str(startup_delay),
+        "--web-port",
+        str(web_port),
     ]
     if args.verbose:
         fuzzer_argv += ["--verbose"]
@@ -137,8 +153,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         fuzzer_argv += ["--fail-on-echo-mismatch"]
 
     print(_tag(f"stem       : {stem}"))
-    print(_tag(f"server     : {args.server}  ({url})"))
+    print(_tag(f"server     : {args.server}  port={port}  ({url})"))
     print(_tag(f"mode       : {args.mode}"))
+    print(_tag(f"web UI     : http://localhost:{web_port}"))
     print(_tag(f"db         : {db_path.name}"))
     print(_tag(f"server log : {server_log.name}"))
     print()
