@@ -9,7 +9,7 @@ Two send modes are supported:
 * ``scenario`` — the bytes value is a fixed-width scenario token (see
   ``src.sequence_mutator.SCENARIOS``). The connection looks the scenario
   up in the registry and executes its steps in order on a single live
-  session. Used by ``--mode multistep`` / ``scenario-lastfuzz`` / ``all``.
+  session. Used by ``--mode sc-shuffle`` / ``sc-capsule`` / ``all``.
 
 After each ``send``, structured results are stashed on the connection
 object so monitors can inspect what happened:

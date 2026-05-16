@@ -627,36 +627,42 @@ def _build_multistep_scenarios():
     }
 
 
-def _build_lastfuzz_capsules() -> list:
+def _build_sc_capsule_blobs() -> list:
     """
-    Build a list of malformed capsule blobs for scenario-lastfuzz mode.
+    Build the capsule-injection corpus for sc-capsule mode.
 
-    Mirrors the oneshot fuzzer's independent-axis strategy (not a full
-    cross-product) to keep the test count manageable:
+    Two sub-corpora, unioned and deduplicated:
 
-      Axis 1 — Fuzz capsule type, use a neutral length+payload:
+    **Tier A** — spec-typed capsule mutations reused directly from
+    ``_build_tier_a_blobs()``: ``QuicVarInt`` sizer mutations, ``s_dword``
+    error codes, ``s_string`` messages on real capsule types. No code
+    duplication — the same corpus that drives oneshot is injected here
+    into stateful sessions, which is the key added coverage value.
+
+    **Raw axes** — structure-agnostic single-axis strategy (not the full
+    cross-product from oneshot) to keep test count manageable given the
+    per-test-case cost of running setup steps:
+
+      Axis 1 — Fuzz capsule type, neutral length+payload:
                [FuzzedType][0x00]  (length=0, no body)
 
-      Axis 2 — Fuzz length+payload, use a neutral capsule type:
-               [0x00][FuzzedLengthAndPayload]  (type=0, unknown → must be ignored)
+      Axis 2 — Fuzz length+payload, neutral type:
+               [0x00][FuzzedBytes]  and  [0x00][len(payload)][payload]
 
-    Reuses ALL_INTERESTING_BYTES from the oneshot definition to stay DRY.
+    Reuses ``ALL_INTERESTING_BYTES`` to stay DRY.
     """
     DEFAULT_LENGTH_PAYLOAD = b"\x00"  # VarInt length=0, empty body
-    DEFAULT_TYPE = b"\x00"  # Type 0 (unknown, must be ignored per RFC 9297)
+    DEFAULT_TYPE = b"\x00"  # Type 0: unknown, must be ignored per RFC 9297
 
-    blobs = [t + DEFAULT_LENGTH_PAYLOAD for t in ALL_INTERESTING_BYTES]
-    # Axis 2 — fuzz length+payload, neutral type. Both with empty body
-    # (length itself fuzzed) and with valid length covering an
-    # interesting payload, sharing the same neutral type prefix.
-    blobs += [DEFAULT_TYPE + lb for lb in ALL_INTERESTING_BYTES]
-    blobs += [
+    raw = [t + DEFAULT_LENGTH_PAYLOAD for t in ALL_INTERESTING_BYTES]
+    raw += [DEFAULT_TYPE + lb for lb in ALL_INTERESTING_BYTES]
+    raw += [
         DEFAULT_TYPE + encode_quic_varint(len(p)) + p for p in ALL_INTERESTING_BYTES
     ]
-    return list(dict.fromkeys(blobs))
+    return list(dict.fromkeys(_build_tier_a_blobs() + raw))
 
 
-def _multistep_mutations() -> list:
+def _sc_shuffle_mutations() -> list:
     """All scenario mutations across all named scenarios, deduplicated."""
     from src.sequence_mutator import generate_sequence_mutations
 
@@ -670,20 +676,38 @@ def _multistep_mutations() -> list:
     return out
 
 
-def _lastfuzz_scenarios() -> list:
+def _sc_capsule_scenarios() -> list:
     """
-    Each named scenario, in original order, with its last step replaced
-    by every malformed capsule from ``_build_lastfuzz_capsules``.
+    Capsule-injection scenarios: each named scenario with its first *and*
+    last step replaced by every blob from ``_build_sc_capsule_blobs()``,
+    deduplicated across both ends.
+
+    * **Last-step injection** — malformed capsule after normal setup steps.
+      Tests parser state when the server already has streams/flow-control
+      counters in memory.
+
+    * **First-step injection** — malformed capsule before any legitimate
+      state is established. Tests the rejection path before any session
+      state exists; exercises different parser branches than last-step.
     """
     from src.sequence_mutator import step_capsule
 
-    fuzz_blobs = _build_lastfuzz_capsules()
+    fuzz_blobs = _build_sc_capsule_blobs()
     seen: set = set()
     out: list = []
     for scenario in _build_multistep_scenarios().values():
-        prefix = tuple(scenario[:-1]) if len(scenario) > 1 else ()
+        scenario = tuple(scenario)
+        # Last-step injection: prefix + fuzzed capsule
+        prefix = scenario[:-1] if len(scenario) > 1 else ()
         for blob in fuzz_blobs:
             mutation = prefix + (step_capsule(blob),)
+            if mutation not in seen:
+                seen.add(mutation)
+                out.append(mutation)
+        # First-step injection: fuzzed capsule + suffix
+        suffix = scenario[1:] if len(scenario) > 1 else ()
+        for blob in fuzz_blobs:
+            mutation = (step_capsule(blob),) + suffix
             if mutation not in seen:
                 seen.add(mutation)
                 out.append(mutation)
@@ -708,31 +732,36 @@ def _register_scenarios(scenarios: list) -> list:
     return [SCENARIOS.register(s) for s in scenarios]
 
 
-def define_scenario_lastfuzz(session_name="wt_scenario_lastfuzz"):
+def define_sc_capsule(session_name="wt_sc_capsule"):
     """
-    Scenario-lastfuzz mode: play each scenario in original order (no
-    permutations), but replace the last step with a malformed capsule.
+    Sc-capsule mode: inject a malformed capsule at the first and last
+    position of each named scenario.
 
     Combines the state-richness of multistep scenarios (server has real
-    streams in flight) with the capsule-level coverage of oneshot.
+    streams and flow-control state in memory) with the full Tier-A +
+    raw-axis capsule corpus. Last-step injection tests parser behaviour
+    after state is established; first-step injection tests the rejection
+    path before any session state exists.
 
-    Test cases = scenarios × fuzz blobs (deduplicated).
+    Test cases = scenarios × fuzz blobs × 2 ends (deduplicated).
     """
-    tokens = _register_scenarios(_lastfuzz_scenarios())
+    tokens = _register_scenarios(_sc_capsule_scenarios())
     _reset_request(session_name)
     s_initialize(session_name)
-    s_group(values=list(dict.fromkeys(tokens)), name="ScenarioLastFuzz")
+    s_group(values=list(dict.fromkeys(tokens)), name="ScCapsule")
     return s_get(session_name)
 
 
 def define_all(session_name="wt_all"):
     """
-    Combined mode: oneshot (as 1-step scenarios) + multistep + scenario-lastfuzz
+    Combined mode: oneshot (as 1-step scenarios) + sc-shuffle + sc-capsule
     in a single boofuzz s_group, all executed via the same scenario path.
 
     Test cases are deduplicated across modes.
     """
-    scenarios = _oneshot_as_scenarios() + _multistep_mutations() + _lastfuzz_scenarios()
+    scenarios = (
+        _oneshot_as_scenarios() + _sc_shuffle_mutations() + _sc_capsule_scenarios()
+    )
     tokens = _register_scenarios(scenarios)
     _reset_request(session_name)
     s_initialize(session_name)
@@ -740,13 +769,16 @@ def define_all(session_name="wt_all"):
     return s_get(session_name)
 
 
-def define_multistep(session_name="wt_multistep"):
+def define_sc_shuffle(session_name="wt_sc_shuffle"):
     """
-    Multistep scenario fuzzer: every mutation of every named scenario,
+    Sc-shuffle mode: every step-reordering mutation of every named scenario,
     executed step-by-step on a single live WebTransport session.
+
+    Mutation operators: permutations, duplications, omissions, rapid-fire
+    bursts, reversal, prohibited-capsule injections, post-CLOSE probes.
     """
-    tokens = _register_scenarios(_multistep_mutations())
+    tokens = _register_scenarios(_sc_shuffle_mutations())
     _reset_request(session_name)
     s_initialize(session_name)
-    s_group(values=list(dict.fromkeys(tokens)), name="ScenarioSequence")
+    s_group(values=list(dict.fromkeys(tokens)), name="ScShuffle")
     return s_get(session_name)

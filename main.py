@@ -25,9 +25,9 @@ from boofuzz import Session, Target
 
 from src.boofuzz_definitions import (
     define_all,
-    define_multistep,
+    define_sc_capsule,
+    define_sc_shuffle,
     define_oneshot_capsule,
-    define_scenario_lastfuzz,
 )
 from src.echo_monitor import EchoCompareMonitor
 from src.fuzzer_connection import (
@@ -46,9 +46,9 @@ os.makedirs("failures", exist_ok=True)
 
 _MODE_DESCRIPTIONS = {
     "oneshot": "One-shot (single malformed capsule per connection)",
-    "multistep": "Multistep (data streams + capsule sequences)",
-    "scenario-lastfuzz": "Scenario-LastFuzz (scenario + fuzzed last step)",
-    "all": "All modes combined (oneshot + multistep + lastfuzz)",
+    "sc-shuffle": "Sc-shuffle (step-reordering mutations on named scenarios)",
+    "sc-capsule": "Sc-capsule (malformed capsule injected at first/last step)",
+    "all": "All modes combined (oneshot + sc-shuffle + sc-capsule)",
 }
 
 
@@ -171,12 +171,12 @@ def _run_fuzz(args: argparse.Namespace) -> int:
     if args.mode == "oneshot":
         send_mode = SEND_MODE_CAPSULE
         msg = define_oneshot_capsule(session_name="wt_oneshot")
-    elif args.mode == "multistep":
+    elif args.mode == "sc-shuffle":
         send_mode = SEND_MODE_SCENARIO
-        msg = define_multistep(session_name="wt_multistep")
-    elif args.mode == "scenario-lastfuzz":
+        msg = define_sc_shuffle(session_name="wt_sc_shuffle")
+    elif args.mode == "sc-capsule":
         send_mode = SEND_MODE_SCENARIO
-        msg = define_scenario_lastfuzz(session_name="wt_scenario_lastfuzz")
+        msg = define_sc_capsule(session_name="wt_sc_capsule")
     elif args.mode == "all":
         send_mode = SEND_MODE_SCENARIO
         msg = define_all(session_name="wt_all")
