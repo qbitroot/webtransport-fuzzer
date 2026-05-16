@@ -44,7 +44,7 @@ from aioquic.quic.events import (
 )
 
 BIND_ADDRESS = "0.0.0.0"
-BIND_PORT = 6161
+BIND_PORT = 6000
 
 logger = logging.getLogger(__name__)
 

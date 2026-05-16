@@ -42,7 +42,7 @@ macro_rules! wtfuzz {
     }};
 }
 
-const BIND_PORT: u16 = 6161;
+const BIND_PORT: u16 = 6001;
 
 #[tokio::main]
 async fn main() -> Result<()> {

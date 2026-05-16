@@ -143,7 +143,7 @@ def _print_banner(mode: str) -> None:
 def _run_validation(url: str) -> int:
     """Open one connection, send a bidi echo probe, report the result."""
     logger.info("Validation mode: probing %s", url)
-    conn = WebTransportConnection(url, timeout=3.0)
+    conn = WebTransportConnection(url, timeout=0.5)
     try:
         conn.open()
     except Exception:
@@ -221,7 +221,7 @@ def _run_fuzz(args: argparse.Namespace) -> int:
         logger.error("Unknown mode: %s", args.mode)
         return 1
 
-    connection = WebTransportConnection(args.url, timeout=3.0, send_mode=send_mode)
+    connection = WebTransportConnection(args.url, timeout=0.5, send_mode=send_mode)
     total = msg.num_mutations()
     logger.info("Mode %s: %d test cases queued", args.mode, total)
 

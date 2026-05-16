@@ -49,21 +49,21 @@ SERVERS = {
         "port": 6000,
         "web_port": 26000,
         "path": "/echo",
-        "startup_delay": 1.5,
+        "startup_delay": 10.0,
     },
     "wtransport": {
-        "cmd": "cargo run --manifest-path {root}/server/wtransport/Cargo.toml --release --quiet --",
+        "cmd": "cargo run --manifest-path {root}/server/wtransport/Cargo.toml --release --quiet",
         "port": 6001,
         "web_port": 26001,
         "path": "/echo",
-        "startup_delay": 60.0,
+        "startup_delay": 120.0,
     },
     "go": {
         "cmd": "{root}/server/webtransport-go/webtransport-go-server",
         "port": 6002,
         "web_port": 26002,
         "path": "/echo",
-        "startup_delay": 1.0,
+        "startup_delay": 10.0,
     },
 }
 
@@ -115,8 +115,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     db_path = LOGS_DIR / f"{stem}.db"
     server_log = LOGS_DIR / f"{stem}.server.log"
 
-    # Build server command with the configured port.
-    base_cmd = f"{_server_cmd(args.server)} --port {port}"
+    # Server port is hardcoded in each server's source; we don't pass --port.
+    base_cmd = _server_cmd(args.server)
     if args.verbose:
         server_cmd = f"{base_cmd} 2>&1 | tee {server_log}"
     else:

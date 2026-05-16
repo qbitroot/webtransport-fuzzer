@@ -42,7 +42,7 @@ import (
 	webtransport "github.com/quic-go/webtransport-go"
 )
 
-const bindAddr = "0.0.0.0:6161"
+const bindAddr = "0.0.0.0:6002"
 
 // wtfuzz emits a structured WTFUZZ line to stdout.
 // fmt.Fprintln on os.Stdout issues a single write(2) syscall, which is

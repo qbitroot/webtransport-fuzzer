@@ -88,7 +88,7 @@ class WebTransportConnection(ITargetConnection):
     """
 
     def __init__(
-        self, url: str, timeout: float = 1.0, send_mode: str = SEND_MODE_CAPSULE
+        self, url: str, timeout: float = 0.5, send_mode: str = SEND_MODE_CAPSULE
     ):
         if send_mode not in _VALID_SEND_MODES:
             raise ValueError(
