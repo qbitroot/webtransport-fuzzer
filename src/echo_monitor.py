@@ -1,26 +1,23 @@
 """
 Echo-comparison monitor.
 
-After each test case, two things happen:
+Two things happen around each test case:
 
-1. **Per-step echo logging.** For every executed step the connection
-   recorded a ``StepOutcome`` (echo bytes, match/no-match, error). The
-   monitor logs each one. For fuzzed scenarios this is informational —
-   missing echoes are common and not necessarily bugs.
+1. **Pre-send health probe.** Before the fuzz payload is sent, a single
+   bidi echo of the magic bytes ``HEALTHCHECK`` is sent on the
+   still-fresh WebTransport session. This confirms the echo path is
+   functional *before* the malformed data is injected. A failure here
+   means the session was broken before we even fuzzed — the test case is
+   marked as a boofuzz failure and written to ``failures/``.
 
-2. **In-session health probe.** A single bidi echo of the magic bytes
-   ``HEALTHCHECK`` is sent on the *same* WebTransport session before
-   close. This catches servers that accepted a malformed capsule without
-   crashing but whose echo path is now broken (silent state
-   corruption). If the probe fails (no response, mismatched response,
-   or exception), the test case is marked as a boofuzz failure and a
-   record is written to ``failures/``.
+2. **Post-send per-step echo logging.** For every executed step the
+   connection recorded a ``StepOutcome`` (echo bytes, match/no-match,
+   error). The monitor logs each one. For fuzzed scenarios this is
+   informational — missing echoes are common and not necessarily bugs.
 
-No fresh-handshake probe is performed: the in-session probe is enough
-to detect echo-path damage, and the next test case's ``open()`` is the
-implicit liveness check for the QUIC handshake path. This keeps
-exactly one QUIC handshake per test case, removing the crash-attribution
-ambiguity of the prior two-session design.
+Server-crash detection is implicit: the *next* test case's ``open()``
+fails if the server went down, and boofuzz's retry policy handles
+that. This keeps exactly one QUIC handshake per test case.
 """
 
 from __future__ import annotations
@@ -78,13 +75,16 @@ def _save_failure(
 
 class EchoCompareMonitor(BaseMonitor):
     """
-    Inspect per-step outcomes and run an in-session health probe.
+    Run a pre-send health probe and inspect post-send per-step outcomes.
 
-    A failed health probe always escalates to a boofuzz failure (the server
-    is broken in some observable way). Per-step echo mismatches only
-    escalate if ``fail_on_mismatch=True`` — useful for pristine scenarios
-    against a server you trust to behave; off by default because fuzzed
-    scenarios will legitimately drop or distort echoes.
+    The health probe runs *before* the fuzz payload to confirm the echo
+    path is functional on the fresh session. A failure means the session
+    was broken before fuzzing — always escalated to a boofuzz failure.
+
+    Per-step echo mismatches only escalate if ``fail_on_mismatch=True``
+    — useful for pristine scenarios against a server you trust to behave;
+    off by default because fuzzed scenarios will legitimately drop or
+    distort echoes.
     """
 
     def __init__(self, fail_on_mismatch: bool = False, probe_timeout: float = 1.0):
@@ -92,7 +92,33 @@ class EchoCompareMonitor(BaseMonitor):
         self.fail_on_mismatch = fail_on_mismatch
         self.probe_timeout = probe_timeout
 
+    def pre_send(self, target, fuzz_data_logger, session, *args, **kwargs):
+        """Health probe: confirm echo path works before the fuzz payload."""
+        conn = getattr(target, "_target_connection", None)
+        if conn is None:
+            fuzz_data_logger.log_error("EchoCompareMonitor: no connection on target")
+            return
+
+        health = conn.health_check(timeout=self.probe_timeout)
+        if health.echo_match is True:
+            fuzz_data_logger.log_check("pre_send health_check: echo OK")
+        else:
+            if health.error is not None:
+                fuzz_data_logger.log_fail(
+                    f"pre_send health_check: probe raised {health.error}"
+                )
+            elif health.echo_received is None:
+                fuzz_data_logger.log_fail("pre_send health_check: no echo received")
+            else:
+                fuzz_data_logger.log_fail(
+                    f"pre_send health_check: echo mismatch "
+                    f"(got {health.echo_received!r})"
+                )
+            path = _save_failure([], [], health, "pre_send health_check failed")
+            fuzz_data_logger.log_fail(f"saved failure to {path}")
+
     def post_send(self, target, fuzz_data_logger, session, *args, **kwargs):
+        """Log per-step echo results after the fuzz payload."""
         conn = getattr(target, "_target_connection", None)
         if conn is None:
             fuzz_data_logger.log_error("EchoCompareMonitor: no connection on target")
@@ -101,7 +127,7 @@ class EchoCompareMonitor(BaseMonitor):
         steps: List[Step] = getattr(conn, "last_sent_steps", []) or []
         outcomes: List[StepOutcome] = getattr(conn, "last_step_outcomes", []) or []
 
-        # 1. Log every step's echo result.
+        # Log every step's echo result.
         mismatches = []
         for i, (step, outcome) in enumerate(zip(steps, outcomes)):
             if step.action == "capsule":
@@ -123,24 +149,9 @@ class EchoCompareMonitor(BaseMonitor):
                     )
                 mismatches.append(i)
 
-        # 2. In-session health probe.
-        health = conn.health_check(timeout=self.probe_timeout)
-        if health.echo_match is True:
-            fuzz_data_logger.log_check("health_check: echo OK")
-        else:
-            if health.error is not None:
-                fuzz_data_logger.log_fail(f"health_check: probe raised {health.error}")
-            elif health.echo_received is None:
-                fuzz_data_logger.log_fail("health_check: no echo received")
-            else:
-                fuzz_data_logger.log_fail(
-                    f"health_check: echo mismatch (got {health.echo_received!r})"
-                )
-            path = _save_failure(steps, outcomes, health, "health_check failed")
-            fuzz_data_logger.log_fail(f"saved failure to {path}")
-
-        # 3. Escalate per-step mismatches if requested.
+        # Escalate per-step mismatches if requested.
         if mismatches and self.fail_on_mismatch:
+            health = getattr(conn, "last_health_check", None)
             path = _save_failure(steps, outcomes, health, "echo mismatch")
             fuzz_data_logger.log_fail(
                 f"echo mismatches at steps {mismatches}; saved to {path}"

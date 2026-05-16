@@ -631,35 +631,19 @@ def _build_sc_capsule_blobs() -> list:
     """
     Build the capsule-injection corpus for sc-capsule mode.
 
-    Two sub-corpora, unioned and deduplicated:
-
-    **Tier A** — spec-typed capsule mutations reused directly from
+    Uses only **Tier A** — spec-typed capsule mutations from
     ``_build_tier_a_blobs()``: ``QuicVarInt`` sizer mutations, ``s_dword``
-    error codes, ``s_string`` messages on real capsule types. No code
-    duplication — the same corpus that drives oneshot is injected here
-    into stateful sessions, which is the key added coverage value.
+    error codes, ``s_string`` messages on real capsule types.
 
-    **Raw axes** — structure-agnostic single-axis strategy (not the full
-    cross-product from oneshot) to keep test count manageable given the
-    per-test-case cost of running setup steps:
-
-      Axis 1 — Fuzz capsule type, neutral length+payload:
-               [FuzzedType][0x00]  (length=0, no body)
-
-      Axis 2 — Fuzz length+payload, neutral type:
-               [0x00][FuzzedBytes]  and  [0x00][len(payload)][payload]
-
-    Reuses ``ALL_INTERESTING_BYTES`` to stay DRY.
+    The raw-axis sub-corpora (type-only, type+length, type+length+body
+    from ``ALL_INTERESTING_BYTES``) are intentionally excluded. They
+    overlap heavily with what oneshot already covers in isolation, and
+    the per-test cost is much higher in sc-capsule because each test
+    case must execute setup steps to build server state first. The
+    Tier-A blobs alone provide the meaningful coverage: spec-typed
+    mutations against a stateful session.
     """
-    DEFAULT_LENGTH_PAYLOAD = b"\x00"  # VarInt length=0, empty body
-    DEFAULT_TYPE = b"\x00"  # Type 0: unknown, must be ignored per RFC 9297
-
-    raw = [t + DEFAULT_LENGTH_PAYLOAD for t in ALL_INTERESTING_BYTES]
-    raw += [DEFAULT_TYPE + lb for lb in ALL_INTERESTING_BYTES]
-    raw += [
-        DEFAULT_TYPE + encode_quic_varint(len(p)) + p for p in ALL_INTERESTING_BYTES
-    ]
-    return list(dict.fromkeys(_build_tier_a_blobs() + raw))
+    return _build_tier_a_blobs()
 
 
 def _sc_shuffle_mutations() -> list:
@@ -678,17 +662,19 @@ def _sc_shuffle_mutations() -> list:
 
 def _sc_capsule_scenarios() -> list:
     """
-    Capsule-injection scenarios: each named scenario with its first *and*
-    last step replaced by every blob from ``_build_sc_capsule_blobs()``,
-    deduplicated across both ends.
+    Capsule-injection scenarios: each named scenario with its **last step**
+    replaced by every blob from ``_build_sc_capsule_blobs()``, deduplicated.
 
-    * **Last-step injection** — malformed capsule after normal setup steps.
-      Tests parser state when the server already has streams/flow-control
-      counters in memory.
+    The setup steps (the prefix) run as legitimate traffic to put the
+    server into a specific state (streams open, flow-control counters
+    set, etc.), then the final step fires a malformed capsule. This
+    tests parser behaviour when real session state already exists.
 
-    * **First-step injection** — malformed capsule before any legitimate
-      state is established. Tests the rejection path before any session
-      state exists; exercises different parser branches than last-step.
+    First-step injection is intentionally omitted: the session has no
+    meaningful state right after ``open()``, so injecting a malformed
+    capsule first either kills the session (making suffix steps dead
+    code) or is silently ignored (reducing to oneshot). The coverage
+    value doesn't justify the ~25k extra test cases.
     """
     from src.sequence_mutator import step_capsule
 
@@ -697,17 +683,9 @@ def _sc_capsule_scenarios() -> list:
     out: list = []
     for scenario in _build_multistep_scenarios().values():
         scenario = tuple(scenario)
-        # Last-step injection: prefix + fuzzed capsule
         prefix = scenario[:-1] if len(scenario) > 1 else ()
         for blob in fuzz_blobs:
             mutation = prefix + (step_capsule(blob),)
-            if mutation not in seen:
-                seen.add(mutation)
-                out.append(mutation)
-        # First-step injection: fuzzed capsule + suffix
-        suffix = scenario[1:] if len(scenario) > 1 else ()
-        for blob in fuzz_blobs:
-            mutation = (step_capsule(blob),) + suffix
             if mutation not in seen:
                 seen.add(mutation)
                 out.append(mutation)
@@ -734,16 +712,15 @@ def _register_scenarios(scenarios: list) -> list:
 
 def define_sc_capsule(session_name="wt_sc_capsule"):
     """
-    Sc-capsule mode: inject a malformed capsule at the first and last
-    position of each named scenario.
+    Sc-capsule mode: inject a malformed capsule at the last position of
+    each named scenario.
 
     Combines the state-richness of multistep scenarios (server has real
-    streams and flow-control state in memory) with the full Tier-A +
-    raw-axis capsule corpus. Last-step injection tests parser behaviour
-    after state is established; first-step injection tests the rejection
-    path before any session state exists.
+    streams and flow-control state in memory) with the Tier-A spec-typed
+    capsule corpus. The setup steps run as legitimate traffic, then the
+    final step fires a malformed capsule against the stateful session.
 
-    Test cases = scenarios × fuzz blobs × 2 ends (deduplicated).
+    Test cases = scenarios × Tier-A fuzz blobs (deduplicated).
     """
     tokens = _register_scenarios(_sc_capsule_scenarios())
     _reset_request(session_name)

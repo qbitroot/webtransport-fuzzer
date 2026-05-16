@@ -19,21 +19,21 @@ uv run python main.py --no-fuzz --url https://127.0.0.1:6161/echo
 # One-shot capsule fuzzer (single malformed capsule per connection)
 uv run python main.py --mode oneshot --url https://127.0.0.1:6161/echo
 
-# Multistep scenario fuzzer (interleaved data + capsule sequences)
-uv run python main.py --mode multistep --url https://127.0.0.1:6161/echo
+# Sc-shuffle (step-reordering mutations on named scenarios)
+uv run python main.py --mode sc-shuffle --url https://127.0.0.1:6161/echo
 
-# Scenario-lastfuzz (scenarios in order, last step fuzzed like oneshot)
-uv run python main.py --mode scenario-lastfuzz --url https://127.0.0.1:6161/echo
+# Sc-capsule (malformed capsule injected at last step of each scenario)
+uv run python main.py --mode sc-capsule --url https://127.0.0.1:6161/echo
 
 # All modes combined in a single run
 uv run python main.py --mode all --url https://127.0.0.1:6161/echo
 
 # With server subprocess management
-uv run python main.py --mode multistep --url https://127.0.0.1:6161/echo \
+uv run python main.py --mode sc-shuffle --url https://127.0.0.1:6161/echo \
     --server-cmd "uv run server/aioquic/server.py cert.pem key.pem 2>&1 | tee server.log"
 
 # Resume from a specific test case index
-uv run python main.py --mode multistep --start-index 42 --end-index 100
+uv run python main.py --mode sc-shuffle --start-index 42 --end-index 100
 
 # boofuzz web UI available at http://localhost:26000 during a run
 ```
@@ -46,23 +46,23 @@ uv run python main.py --mode multistep --start-index 42 --end-index 100
 
 Sends a single malformed capsule per connection on the CONNECT stream (the WebTransport session control channel). The capsule type, length field, and payload are all independently fuzzed using interesting boundary values, overlong VarInt encodings, cross-layer type confusion (injecting QUIC/HTTP3 frame type bytes as capsule types), and more.
 
-Each test case is one `[CapsuleType][CapsuleLength][Payload]` blob. After sending, the health check (echo probe on a fresh bidirectional stream) verifies the server is still alive.
+Each test case is one `[CapsuleType][CapsuleLength][Payload]` blob. Before sending, a health check (echo probe on a fresh bidirectional stream) verifies the session is functional. Server-crash detection is implicit: the next test case's connection handshake fails if the server went down.
 
-### `--mode scenario-lastfuzz`
+### `--mode sc-capsule`
 
-Executes each scenario in its original step order (no permutations or mutations), but replaces the **last step** with a fuzzed malformed capsule — the same `[CapsuleType][CapsuleLength][Payload]` values used by oneshot mode.
+Executes each scenario's setup steps as legitimate traffic (opening streams, sending data, setting flow-control state), then replaces the **last step** with a fuzzed malformed capsule from the Tier-A spec-typed corpus (the same `QuicVarInt` sizer mutations, `s_dword` error codes, and `s_string` message mutations used for each capsule type in oneshot).
 
-This combines the state-richness of multistep scenarios (the server has real streams and data in flight) with oneshot-style capsule coverage. Each test case plays the scenario's prefix steps as legitimate traffic to put the server into a specific state, then fires a single malformed capsule.
+This combines the state-richness of multistep scenarios (the server has real streams and data in flight) with spec-aware capsule coverage. Each test case puts the server into a specific state, then fires a single malformed capsule.
 
-Test cases = scenarios × oneshot fuzz values. Uses the same 12 scenarios as multistep and the same `ALL_INTERESTING_BYTES` pool as oneshot.
+Test cases = 12 scenarios × Tier-A fuzz blobs (deduplicated).
 
 ### `--mode all`
 
-Runs all three modes (oneshot, multistep, scenario-lastfuzz) in a single unified session. Oneshot capsules are wrapped as single-step scenarios so the entire run uses the same executor. Test cases are deduplicated across modes.
+Runs all three modes (oneshot, sc-shuffle, sc-capsule) in a single unified session. Oneshot capsules are wrapped as single-step scenarios so the entire run uses the same executor. Test cases are deduplicated across modes.
 
 This is the "fire and forget" option for maximum coverage in one invocation.
 
-### `--mode multistep`
+### `--mode sc-shuffle`
 
 Executes multi-step scenarios that interleave real data activity with capsule sequences on a single live session. Designed to trigger state-machine bugs: use-after-free, state confusion after close, crash-on-reorder, etc.
 
