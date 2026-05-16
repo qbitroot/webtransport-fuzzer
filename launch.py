@@ -102,9 +102,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     url = args.url or server_cfg["url"]
     startup_delay = args.startup_delay or server_cfg["startup_delay"]
 
-    # Redirect server stdout to the log file via shell piping.
-    # ServerManager runs the command with shell=True, so this works directly.
-    server_cmd = f"{_server_cmd(args.server)} 2>&1 | tee {server_log}"
+    # Redirect server output to the log file.
+    # With -v: tee to both file and terminal.  Without: file only (quiet).
+    base_cmd = _server_cmd(args.server)
+    if args.verbose:
+        server_cmd = f"{base_cmd} 2>&1 | tee {server_log}"
+    else:
+        server_cmd = f"{base_cmd} > {server_log} 2>&1"
 
     fuzzer_argv = [
         "uv",
@@ -121,6 +125,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         "--server-startup-delay",
         str(startup_delay),
     ]
+    if args.verbose:
+        fuzzer_argv += ["--verbose"]
     if args.start_index:
         fuzzer_argv += ["--start-index", str(args.start_index)]
     if args.end_index:
@@ -343,6 +349,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--end-index", type=int, help="Stop after this test case index.")
     run_p.add_argument("--no-echo-monitor", action="store_true")
     run_p.add_argument("--fail-on-echo-mismatch", action="store_true")
+    run_p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show per-test-case logs and server stdout (default: quiet).",
+    )
     run_p.add_argument(
         "--no-analyze",
         action="store_true",

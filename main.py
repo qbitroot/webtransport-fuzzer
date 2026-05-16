@@ -39,9 +39,25 @@ from src.fuzzer_connection import (
 LOG_FMT = "%(asctime)s [%(levelname)5s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger("wt_fuzzer")
-logging.getLogger("tornado.access").setLevel(logging.WARNING)
 
 os.makedirs("failures", exist_ok=True)
+
+# Loggers that are noisy per-test-case (open/close/session setup lines).
+# Quieted to WARNING by default; -v restores them to INFO.
+_NOISY_LOGGERS = [
+    "src.fuzzer_connection",
+    "src.webtransport_client",
+    "src.log_db",
+    "quic",
+    "asyncio",
+    "tornado.access",
+]
+
+
+def _configure_logging(verbose: bool) -> None:
+    if not verbose:
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 _MODE_DESCRIPTIONS = {
@@ -91,6 +107,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Path to the SQLite log DB (default: boofuzz-results/run_<timestamp>.db).",
     )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show per-test-case connection/session logs (default: quiet, progress only).",
+    )
     return p
 
 
@@ -138,6 +160,7 @@ def _run_validation(url: str) -> int:
 
 def main() -> int:
     args = _build_argparser().parse_args()
+    _configure_logging(args.verbose)
     _print_banner(args.mode)
     logger.info("Target: %s", args.url)
 
@@ -185,12 +208,14 @@ def _run_fuzz(args: argparse.Namespace) -> int:
         return 1
 
     connection = WebTransportConnection(args.url, timeout=3.0, send_mode=send_mode)
-    logger.info("Mode %s: %d test cases queued", args.mode, msg.num_mutations())
+    total = msg.num_mutations()
+    logger.info("Mode %s: %d test cases queued", args.mode, total)
 
     monitors = []
     if not args.no_echo_monitor:
         monitors.append(EchoCompareMonitor(fail_on_mismatch=args.fail_on_echo_mismatch))
-    monitors.append(RequestLogger(log_db))
+    req_logger = RequestLogger(log_db, total=total)
+    monitors.append(req_logger)
 
     session = Session(
         target=Target(connection=connection, monitors=monitors),
@@ -219,6 +244,7 @@ def _run_fuzz(args: argparse.Namespace) -> int:
         logger.exception("Fuzzing encountered an unexpected error")
         rc = 1
     finally:
+        req_logger.print_summary()
         logger.info("Session finished. Log DB: %s", db_path)
         logger.info(
             "Use analyze_logs.py --log <server.log> --db %s to correlate server output.",
