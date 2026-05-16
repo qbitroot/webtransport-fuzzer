@@ -41,17 +41,17 @@ SERVERS = {
             " {root}/server/aioquic/cert.pem"
             " {root}/server/aioquic/key.pem"
         ),
-        "url": "https://localhost:6161/echo",
+        "url": "https://0.0.0.0:6161/echo",
         "startup_delay": 1.5,
     },
     "wtransport": {
         "cmd": "cargo run --manifest-path {root}/server/wtransport/Cargo.toml --release --quiet",
-        "url": "https://localhost:4433/echo",
+        "url": "https://0.0.0.0:4433/echo",
         "startup_delay": 3.0,
     },
     "go": {
         "cmd": "{root}/server/webtransport-go/webtransport-go-server",
-        "url": "https://localhost:4433/echo",
+        "url": "https://0.0.0.0:4433/echo",
         "startup_delay": 1.0,
     },
 }
