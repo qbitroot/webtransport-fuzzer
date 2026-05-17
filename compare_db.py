@@ -81,7 +81,7 @@ def normalise_raw_text(raw_text: Optional[str], strip_extra: bool) -> str:
             continue
         if strip_extra and line.startswith(WTFUZZ_PREFIX):
             parts = line.split("|")
-            # parts[1] is the event name (conn_idx already stripped by analyze_logs.py)
+            # parts[1] is the event name (conn_idx already stripped by correlate_logs.py)
             event = parts[1] if len(parts) >= 2 else ""
             lines_out.append(f"{WTFUZZ_PREFIX}{event}")
         else:

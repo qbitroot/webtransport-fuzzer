@@ -7,7 +7,7 @@ For oneshot mode there is exactly one ``capsule`` step; for scenario
 modes there is one entry per executed step.
 
 No server-side correlation happens here — that is the job of the
-offline ``analyze_logs.py`` tool, which fills in ``log_group_id`` after
+offline ``correlate_logs.py`` tool, which fills in ``log_group_id`` after
 the fact from the WTFUZZ structured server log.
 """
 

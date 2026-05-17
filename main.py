@@ -262,7 +262,7 @@ def _run_fuzz(args: argparse.Namespace) -> int:
         req_logger.print_summary()
         logger.info("Session finished. Log DB: %s", db_path)
         logger.info(
-            "Use analyze_logs.py --log <server.log> --db %s to correlate server output.",
+            "Use correlate_logs.py --log <server.log> --db %s to correlate server output.",
             db_path,
         )
         log_db.close()

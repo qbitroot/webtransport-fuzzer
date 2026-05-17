@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-analyze_logs.py — correlate a WTFUZZ server log with a fuzzer run database.
+correlate_logs.py — correlate a WTFUZZ server log with a fuzzer run database.
 
 The fuzzer opens exactly one WebTransport session per test case. Inside
 that session it executes the test-case payload (capsule send or scenario
@@ -10,7 +10,7 @@ This script groups the log into sessions by conn_idx, pairs them 1:1 with
 ``test_cases`` rows by insertion order, and fills in ``log_group_id``.
 
 Usage:
-    python analyze_logs.py --log server.log --db boofuzz-results/run_XYZ.db
+    python correlate_logs.py --log server.log --db boofuzz-results/run_XYZ.db
 
 Pairing rule:
     conn_idx 0 ↔ test_cases.id 1
@@ -29,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)5s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("analyze_logs")
+logger = logging.getLogger("correlate_logs")
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +196,7 @@ def main():
     db.close()
 
     print()
-    print("=== analyze_logs summary ===")
+    print("=== correlate_logs summary ===")
     print(f"  Fuzz test cases in DB : {len(fuzz_cases)}")
     print(f"  Sessions in log       : {len(sessions)}")
     print(f"  Matched               : {matched}")

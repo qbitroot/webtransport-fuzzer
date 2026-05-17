@@ -4,7 +4,7 @@ check_compliance.py — evaluate recorded test-case scenarios against
 WebTransport over HTTP/3 protocol compliance rules.
 
 Reads test cases from a fuzzer SQLite database (produced by log_db.py and
-optionally correlated by analyze_logs.py), checks server responses for
+optionally correlated by correlate_logs.py), checks server responses for
 compliance violations, and reports problems grouped by log_group.
 
 Usage:

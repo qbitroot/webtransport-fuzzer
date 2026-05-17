@@ -6,7 +6,7 @@ Produces two files in ./logs/ with a shared stem:
     <server>_<mode>_<timestamp>.db          — fuzzer SQLite database
     <server>_<mode>_<timestamp>.server.log  — server stdout/stderr
 
-After the fuzzer exits, analyze_logs.py is run to correlate the log
+After the fuzzer exits, correlate_logs.py is run to correlate the log
 with the DB (populating log_group_id for each test case).
 
 Server ports (fixed per implementation):
@@ -135,12 +135,12 @@ def main() -> int:
     rc = subprocess.call(fuzzer_argv, cwd=_ROOT)
     print(f"\n[launch] fuzzer exited with code {rc}")
 
-    print(f"[launch] stitching log into db via analyze_logs.py")
+    print(f"[launch] stitching log into db via correlate_logs.py")
     subprocess.call(
         [
             "uv",
             "run",
-            "analyze_logs.py",
+            "correlate_logs.py",
             "--log",
             str(server_log),
             "--db",

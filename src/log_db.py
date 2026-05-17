@@ -7,7 +7,7 @@ Two tables:
   newline-separated ``action(hex)`` lines (one per executed step).
 * ``log_groups`` — unique server-output blocks, deduplicated by SHA-256
   of the joined log lines. ``test_cases.log_group_id`` is filled in
-  offline by ``analyze_logs.py`` once the server log is available.
+  offline by ``correlate_logs.py`` once the server log is available.
 
 Server output is stored verbatim. The WTFUZZ structured log format
 (``WTFUZZ|<conn_idx>|EVENT|k=v|...``) is self-describing; raw lines
@@ -118,7 +118,7 @@ class LogDB:
         sent_steps: list of pre-formatted step strings in "action(hex)" form,
                     one per step sent within the session.
         lines: server log lines for this test case (stored in log_groups).
-               Pass None or [] if log correlation will be done later by analyze_logs.py.
+               Pass None or [] if log correlation will be done later by correlate_logs.py.
 
         Returns the new test_case id.
         """
@@ -136,7 +136,7 @@ class LogDB:
         return cur.lastrowid
 
     def set_log_group(self, test_case_id: int, log_group_id: int) -> None:
-        """Update the log_group_id for an existing test case (used by analyze_logs.py)."""
+        """Update the log_group_id for an existing test case (used by correlate_logs.py)."""
         self._conn.execute(
             "UPDATE test_cases SET log_group_id = ? WHERE id = ?",
             (log_group_id, test_case_id),
