@@ -29,7 +29,7 @@ source "$HOME/.local/bin/env"
 ### Clone and build
 
 ```bash
-git clone <repo>
+git clone https://github.com/qbitroot/webtransport-fuzzer
 cd webtransport-fuzzer
 uv sync
 
