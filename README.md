@@ -7,6 +7,9 @@
 ### Install toolchains (Ubuntu)
 
 ```bash
+# Ensure you have the basic tools
+sudo apt install git curl build-essential
+
 # Rust (via rustup — do not use apt, it ships an old version)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
