@@ -6,9 +6,11 @@ on a live WebTransport session: send a bidi stream, send a uni stream,
 send a datagram, or inject a raw capsule.
 
 The mutator takes a scenario and generates all interesting re-orderings:
-permutations, duplications, omissions, rapid-fire bursts, reversal, and
-prohibited-capsule injections. All operators preserve action types so the
-connection knows how to execute each step.
+permutations, duplications, omissions, step repetition (same step 2/5/10×
+in a row), reversal, and prohibited-capsule injections. All operators
+preserve action types so the connection knows how to execute each step.
+Note: "repetition" is a structural operator — steps still execute
+sequentially with normal per-step timeouts, not concurrently.
 
 For boofuzz transport, scenarios cannot be passed as Python objects through
 ``s_group`` (which only accepts ``bytes``). Instead, ``ScenarioRegistry``
@@ -100,7 +102,10 @@ def _build_prohibited_capsules() -> List[bytes]:
 
 PROHIBITED_CAPSULES = _build_prohibited_capsules()
 
-MAX_PERMUTATIONS = 5040  # 7! — see boofuzz_definitions for rationale
+MAX_PERMUTATIONS = 5040  # 7! — caps factorial blow-up. The largest current
+# scenario (kitchen_sink) has 6 steps → 6! = 720 permutations, well under
+# the cap. Exists to keep an accidentally-grown 8+-step scenario from
+# dominating the run (8! = 40,320).
 
 
 # ---- Mutation engine ----
@@ -145,7 +150,10 @@ def generate_sequence_mutations(scenario: Scenario) -> List[Scenario]:
         for i in range(n):
             add(scenario[:i] + scenario[i + 1 :])
 
-    # 4. Rapid-fire: same step repeated 2/5/10×
+    # 4. Step repetition: same step repeated 2/5/10× back-to-back.
+    #    Executed sequentially with normal per-step timeouts — this is a
+    #    structural duplicate-message test (e.g. 10 DRAIN capsules in a row),
+    #    not a timing or rate test.
     for step in scenario:
         for k in (2, 5, 10):
             add((step,) * k)

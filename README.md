@@ -83,80 +83,103 @@ Targets the capsule layer on the CONNECT stream and data transports (bidirection
 
 ## Fuzzing modes
 
-### `--mode oneshot`
+### Background: CONNECT stream and capsules
 
-Sends a single malformed capsule per connection on the CONNECT stream (the WebTransport session control channel). The capsule type, length field, and payload are all independently fuzzed using interesting boundary values, overlong VarInt encodings, cross-layer type confusion (injecting QUIC/HTTP3 frame type bytes as capsule types), and more.
+A WebTransport session lives inside an HTTP/3 `CONNECT` request. The HTTP/3 stream carrying that `CONNECT` is the **CONNECT stream** — once the server returns `200`, both sides keep this stream open and use it as the session's _control channel_. The bytes exchanged on it are framed as **capsules** (RFC 9297): `[Type (VarInt)][Length (VarInt)][Payload]`. Capsule types carry session-level signals — `WT_CLOSE_SESSION`, `WT_DRAIN_SESSION`, the flow-control family (`WT_MAX_DATA`, `WT_MAX_STREAMS`, …), and so on. Data is _not_ sent as capsules; it travels on separate WebTransport streams (bidi/uni) and QUIC datagrams owned by the same session.
 
-Each test case is one `[CapsuleType][CapsuleLength][Payload]` blob. Before sending, a health check (echo probe on a fresh bidirectional stream) verifies the session is functional. Server-crash detection is implicit: the next test case's connection handshake fails if the server went down.
+### Step types
 
-### `--mode sc-capsule`
-
-Executes each scenario's setup steps as legitimate traffic (opening streams, sending data, setting flow-control state), then replaces the **last step** with a fuzzed malformed capsule from the Tier-A spec-typed corpus (the same `QuicVarInt` sizer mutations, `s_dword` error codes, and `s_string` message mutations used for each capsule type in oneshot).
-
-This combines the state-richness of multistep scenarios (the server has real streams and data in flight) with spec-aware capsule coverage. Each test case puts the server into a specific state, then fires a single malformed capsule.
-
-Test cases = 12 scenarios × Tier-A fuzz blobs (deduplicated).
-
-### `--mode all`
-
-Runs all three modes (oneshot, sc-shuffle, sc-capsule) in a single unified session. Oneshot capsules are wrapped as single-step scenarios so the entire run uses the same executor. Test cases are deduplicated across modes.
-
-This is the "fire and forget" option for maximum coverage in one invocation.
-
-### `--mode sc-shuffle`
-
-Executes multi-step scenarios that interleave real data activity with capsule sequences on a single live session. Designed to trigger state-machine bugs: use-after-free, state confusion after close, crash-on-reorder, etc.
-
-Each **scenario** is a list of steps, where each step is one of:
+Every multistep scenario is a sequence of these four primitives:
 
 | Step            | What happens                                                                                              |
 | --------------- | --------------------------------------------------------------------------------------------------------- |
 | `bidi(hex)`     | Opens a bidirectional WebTransport stream, sends payload, awaits echo (1 s timeout; timeout is non-fatal) |
 | `uni(hex)`      | Opens a unidirectional stream, sends payload, awaits server-pushed echo on a peer stream                  |
 | `datagram(hex)` | Sends a QUIC datagram, awaits echoed datagram                                                             |
-| `capsule(hex)`  | Sends a raw WebTransport capsule on the CONNECT stream (no echo expected)                                 |
+| `capsule(hex)`  | Sends a raw capsule on the CONNECT stream (no echo expected)                                              |
 
-The **mutator** generates all interesting variants from each scenario:
+Steps execute **sequentially** with normal `await`s and per-step timeouts.
 
-- All permutations (reordering)
-- Each step duplicated in place and at end
-- Each step omitted
-- Rapid-fire: same step repeated 2×, 5×, 10×
-- Reversed order
-- Prohibited capsule injection at every position (`WT_MAX_STREAM_DATA` / `WT_STREAM_DATA_BLOCKED`, which MUST cause a session error per draft-15 §5.4)
-- Post-CLOSE activity: bidi/uni/datagram/capsule sent after a CLOSE_SESSION
+### `--mode oneshot`
 
-**~1,500 unique test cases across 12 scenarios** (with `MAX_PERMUTATIONS=5040`).
+Sends a single malformed `[CapsuleType][CapsuleLength][Payload]` blob per connection on the CONNECT stream. A health check (echo probe on a fresh bidirectional stream) runs before each test case; server crashes are detected by handshake failure on the next case.
+
+The corpus is the union of two sub-corpora:
+
+**Spec-typed mutations** — for each canonical capsule type (`WT_CLOSE_SESSION`, `WT_DRAIN_SESSION`, `WT_MAX_DATA`, `WT_MAX_STREAMS` bidi/uni, `WT_DATA_BLOCKED`, `WT_STREAMS_BLOCKED` bidi/uni) a boofuzz Request is built that fuzzes the payload while a `QuicVarInt` sizer keeps `Length` consistent. Payload mutators are `s_dword` (32-bit error code, for CLOSE), `s_string` (UTF-8 message, for CLOSE), and `QuicVarInt` (single VarInt, for the flow-control family). Materialised mutation pool: **1,879 blobs**.
+
+**Structure-agnostic raw mutations** — derived from `ALL_INTERESTING_BYTES`, a list of **85 byte sequences** built by deduplicating the union of: 9 valid capsule type encodings, 28 boundary VarInts, 19 malformed/overlong VarInts, and 41 QUIC + HTTP/3 frame-type bytes (cross-layer type confusion: a parser that demuxes by first-byte prefix can mistake a QUIC `RESET_STREAM` for a capsule type). Three sub-corpora:
+
+| Shape                          | Count           | What it probes                                                           |
+| ------------------------------ | --------------- | ------------------------------------------------------------------------ |
+| `[T]`                          | 85              | truncation, single-byte garbage                                          |
+| `[T][L]` (length but no body)  | 85 × 85 = 7,225 | length / body-length mismatch                                            |
+| `[T][len(B)][B]` (well-framed) | 85 × 85 = 7,225 | foreign payload under a real type — including QUIC/HTTP-3 frames as type |
+
+Raw total before dedup: 85 + 7,225 + 7,225 = **14,535**. After dedup (e.g. the empty-bytes entry collapses several combinations): **14,194**.
+
+**Total oneshot test cases: 1,879 + 14,194 = 16,073 pre-dedup → 16,016 unique blobs** (57 collisions between the spec-typed and raw axes).
+
+Oneshot is a **stateless parser fuzzer** for the capsule framing on the CONNECT stream.
+
+### `--mode sc-shuffle`
+
+Executes multi-step scenarios that interleave real data activity with capsule sequences on a single live session. Every mutation is composed of well-formed primitives, so crashes here are unambiguous state-machine bugs (use-after-free, state confusion after close, crash on out-of-order capsules) rather than parser bugs already covered by oneshot.
 
 #### Scenarios
 
-| Scenario                         | Steps                                     | Tests                                   |
-| -------------------------------- | ----------------------------------------- | --------------------------------------- |
-| `bidi_then_shutdown`             | bidi → drain → close                      | Close race with active echo             |
-| `all_transports_then_close`      | bidi + uni + dgram → close                | All 3 paths, then teardown              |
-| `capsule_between_bidi`           | bidi → MAX_DATA → bidi                    | Capsule disrupts stream processing      |
-| `drain_mid_data`                 | bidi → drain → bidi + uni                 | Drain while streams are active          |
-| `flow_with_streams`              | MAX_STREAMS → bidi → MAX_DATA → uni       | Flow control with live data             |
-| `close_error_after_data`         | bidi + dgram → close(42, msg)             | Error code parsing after real activity  |
-| `rapid_bidi_close`               | bidi × 3 → close                          | Rapid stream creation before close      |
-| `datagram_flood_drain`           | dgram × 3 → drain                         | Drain during datagram processing        |
-| `uni_capsule_interleave`         | uni/capsule alternating × 5               | Capsules don't corrupt uni handling     |
-| `kitchen_sink`                   | all 6 action types                        | Maximum permutation surface             |
-| `contradictory_limits_with_data` | MAX_DATA(0) → bidi → MAX_DATA(64K) → bidi | Limit changes with live data            |
-| `blocked_then_create`            | STREAMS_BLOCKED → bidi → BLOCKED → uni    | Creating streams despite blocked signal |
+Twelve hand-picked scenarios (`src/boofuzz_definitions.py:511`) drawn from five design categories:
 
-#### Version compatibility
+1. **End-to-end teardown** — exercise one or more data paths then close gracefully. _(`bidi_then_shutdown`, `all_transports_then_close`, `close_error_after_data`, `multi_bidi_then_close`, `multi_datagram_then_drain`)_
+2. **Control capsule between data** — inject a flow-control or drain capsule in the middle of an otherwise data-only sequence; tests that capsule handling doesn't corrupt stream/datagram processing. _(`capsule_between_bidi`, `drain_mid_data`, `uni_capsule_interleave`)_
+3. **Live flow-control changes** — adjust `MAX_DATA`/`MAX_STREAMS` while data is in flight. _(`flow_with_streams`)_
+4. **Self-contradicting limits** — set a limit that blocks an action, then perform it; or signal `STREAMS_BLOCKED` and immediately open a stream. _(`contradictory_limits_with_data`, `blocked_then_create`)_
+5. **Maximum step diversity** — one of every primitive plus every control capsule; produces the largest permutation surface. _(`kitchen_sink`)_
 
-All three server generations (GEN1 draft-03, GEN3 draft-09, GEN4 draft-15) are targeted simultaneously. Unknown capsule types MUST be silently ignored per RFC 9297, so flow-control capsules sent to GEN1 servers are valid test cases — if a GEN1 server crashes on them, that's a bug.
+**Why not just add more scenarios?** The mutation engine already generates every permutation, duplication, omission, repetition, reversal, prohibited-capsule injection, and post-CLOSE follow-up of whatever step list you give it. A new hand-written scenario adds value only if it contains a **structurally new step composition** the operators can't reach from the existing 12 — e.g. a step type none of them use (there are only four), or a control primitive none of them issue (the canonical set is small and fully covered). In practice, new scenarios assembled from the same primitives produce mutations that collide with existing ones during dedup; the marginal coverage approaches zero quickly. The 12 chosen scenarios were picked so each category above is represented at least twice with different step counts, giving the operators dense input variety.
+
+#### Mutation operators
+
+`generate_sequence_mutations` (`src/sequence_mutator.py:109`) applies every operator below to every scenario, then unions and deduplicates:
+
+| #   | Operator                                          | Output count (n = scenario length)                 | Targets                                                                                                                        |
+| --- | ------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| 0   | identity                                          | 1                                                  | baseline; must pass                                                                                                            |
+| 1   | permutations                                      | `min(n!, 5040)`                                    | order-dependent state assumptions                                                                                              |
+| 2a  | duplicate-in-place per step                       | n                                                  | duplicate-message handling (e.g. double CLOSE)                                                                                 |
+| 2b  | duplicate-at-end per step                         | n                                                  | trailing duplicate after completion                                                                                            |
+| 3   | omit each step                                    | n                                                  | missing-prerequisite paths                                                                                                     |
+| 4   | step repetition: same step 2× / 5× / 10× in a row | 3n                                                 | duplicate-message handling at the protocol level (e.g. 10 DRAIN capsules sent back-to-back, each with normal per-step timeout) |
+| 5   | reversed order                                    | 1                                                  | full inversion                                                                                                                 |
+| 6   | prohibited-capsule injection at every position    | 2 × (n + 1)                                        | `WT_MAX_STREAM_DATA` / `WT_STREAM_DATA_BLOCKED` — receipt MUST be a session error per draft-15 §5.4                            |
+| 7   | post-CLOSE_SESSION activity                       | 6 follow-ups × (`CLOSE_SESSION` steps in scenario) | use-after-close on a "closed" session                                                                                          |
+
+`MAX_PERMUTATIONS = 5040 = 7!` caps factorial blow-up; `kitchen_sink` (n=6) is the largest at 720 permutations, well under the cap.
+
+**Total: 1,520 test cases** across all 12 scenarios after dedup.
+
+All three server generations (GEN1 draft-03, GEN3 draft-09, GEN4 draft-15) are targeted simultaneously. Unknown capsule types MUST be silently ignored per RFC 9297, so flow-control capsules sent to a GEN1 server are valid test cases.
+
+### `--mode sc-capsule`
+
+Each scenario's setup steps run as legitimate traffic to build server state (open streams, flow-control counters, queued echoes), then the **last step** is replaced with a spec-typed fuzzed capsule. Fuzzes the capsule parser _while the server holds real session state_ — a code path stateless oneshot fuzzing cannot reach.
+
+Test cases = 12 scenarios × 1,879 spec-typed blobs, deduplicated → **22,548 test cases**. First-step injection is omitted (no meaningful state right after `open()`); raw blobs are omitted (overlap with oneshot, too expensive per case).
+
+### `--mode all`
+
+Runs oneshot, sc-shuffle, and sc-capsule in one session, all executed via the same scenario executor (oneshot blobs wrapped as single-step scenarios).
+
+**Total: 40,083 test cases** (16,016 + 1,520 + 22,548 = 40,084 pre-dedup; one collision).
 
 ---
 
 ## Server fingerprinting
 
-Before fuzzing, use `get-server-version.py` to identify which draft generation the target implements:
+Before fuzzing, use `server_version.py` to identify which draft generation the target implements:
 
 ```bash
-uv run get-server-version.py --no-verify 127.0.0.1 6161
+uv run server_version.py --no-verify 127.0.0.1 6161
 ```
 
 ---
@@ -254,7 +277,7 @@ src/
   log_db.py               — SQLite schema + access
   server_manager.py       — optional server subprocess lifecycle
 correlate_logs.py         — offline log correlation tool
-get-server-version.py     — server draft-version fingerprinting tool
+server_version.py         — server draft-version fingerprinting tool
 server/
   aioquic/                — Python echo server (draft-03)
   wtransport/             — Rust echo server (draft-09)
@@ -266,6 +289,6 @@ server/
 ## Notes
 
 - Use `uv run` for all commands (manages the venv).
-- TLS verification is disabled by default (self-signed certs). Use `--no-verify` with `get-server-version.py`.
+- TLS verification is disabled by default (self-signed certs). Use `--no-verify` with `server_version.py`.
 - To test from a browser: install mkcert and launch Chrome with `--origin-to-force-quic-on=127.0.0.1:6000`. Chrome does not support [localhost TLS for HTTP/3](https://news.ycombinator.com/item?id=41748640).
 - The boofuzz web UI ports: aioquic=26000, wtransport=26001, go=26002 (set per server in `launch.py`).

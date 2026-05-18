@@ -499,8 +499,8 @@ def build_streams_blocked(limit: int, bidi: bool = True) -> bytes:
 # Each scenario is a list of Step instances (see src.sequence_mutator).
 # Steps cover the four WebTransport actions: bidi, uni, datagram, capsule.
 # The sequence_mutator generates permutations, duplications, omissions,
-# rapid-fire bursts, reversal, and prohibited-capsule injections —
-# including post-CLOSE data activity.
+# step repetition (2/5/10× back-to-back), reversal, and prohibited-capsule
+# injections — including post-CLOSE data activity.
 #
 # Multistep is fundamentally different from oneshot: the server has real
 # streams and data in flight when fuzzed capsules arrive, giving the
@@ -570,19 +570,22 @@ def _build_multistep_scenarios():
             step_datagram(b"NORMAL_DG"),
             step_capsule(build_close_session(error_code=42, message="test error")),
         ],
-        # ---- Scenario 7: Rapid bidi then close ----
-        # Burst of bidi streams followed by immediate close.
-        # Tests: does the server handle rapid stream creation before close?
-        "rapid_bidi_close": [
+        # ---- Scenario 7: Multiple bidi streams then close ----
+        # Three bidi streams opened sequentially before a CLOSE_SESSION.
+        # Tests: does the server correctly track and tear down multiple
+        # in-flight stream contexts when CLOSE arrives before any of them
+        # have been fully echoed/drained?
+        "multi_bidi_then_close": [
             step_bidi(b"A"),
             step_bidi(b"BB"),
             step_bidi(b"CCC"),
             step_capsule(build_close_session(error_code=0)),
         ],
-        # ---- Scenario 8: Datagram flood then drain ----
-        # Multiple datagrams then a drain signal.
-        # Datagrams are unreliable; tests: drain during datagram processing.
-        "datagram_flood_drain": [
+        # ---- Scenario 8: Multiple datagrams then drain ----
+        # Three datagrams sent sequentially then a DRAIN_SESSION.
+        # Datagrams are unreliable; tests: does DRAIN arrive correctly when
+        # the server has unacked datagrams queued?
+        "multi_datagram_then_drain": [
             step_datagram(b"D1"),
             step_datagram(b"D2"),
             step_datagram(b"D3"),
@@ -751,8 +754,9 @@ def define_sc_shuffle(session_name="wt_sc_shuffle"):
     Sc-shuffle mode: every step-reordering mutation of every named scenario,
     executed step-by-step on a single live WebTransport session.
 
-    Mutation operators: permutations, duplications, omissions, rapid-fire
-    bursts, reversal, prohibited-capsule injections, post-CLOSE probes.
+    Mutation operators: permutations, duplications, omissions, step
+    repetition (2/5/10× back-to-back), reversal, prohibited-capsule
+    injections, post-CLOSE probes.
     """
     tokens = _register_scenarios(_sc_shuffle_mutations())
     _reset_request(session_name)
