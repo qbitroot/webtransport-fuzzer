@@ -74,13 +74,12 @@ async def interactive_mode(client: WebTransportClient):
                 if cmd_type == "d":
                     client.send_datagram(data)
                     logger.info("Sent datagram: %s", message)
-                    echo = await client.receive_datagram(timeout=2.0)
+                    echo = await client.receive_datagram_echo(timeout=2.0)
                     _check_echo("datagram", data, echo)
                 elif cmd_type == "u":
                     await client.send_unidirectional_stream(data)
                     logger.info("Sent unidirectional stream: %s", message)
-                    result = await client.receive_stream_data(timeout=2.0)
-                    echo = result[1] if result else None
+                    echo = await client.receive_stream_echo(timeout=2.0)
                     _check_echo("uni stream", data, echo)
                 elif cmd_type == "b":
                     stream_id, response = await client.send_bidirectional_stream(data)
@@ -127,7 +126,7 @@ async def demo_mode(client: WebTransportClient):
     logger.info("Test 1: Sending datagram...")
     dgram_payload = b"Hello via datagram!"
     client.send_datagram(dgram_payload)
-    echo = await client.receive_datagram(timeout=2.0)
+    echo = await client.receive_datagram_echo(timeout=2.0)
     if _check_echo("Test 1 (datagram)", dgram_payload, echo):
         passed += 1
     else:
@@ -137,8 +136,7 @@ async def demo_mode(client: WebTransportClient):
     logger.info("\nTest 2: Sending unidirectional stream...")
     uni_payload = b"Hello via unidirectional stream!"
     await client.send_unidirectional_stream(uni_payload)
-    result = await client.receive_stream_data(timeout=2.0)
-    echo = result[1] if result else None
+    echo = await client.receive_stream_echo(timeout=2.0)
     if _check_echo("Test 2 (uni stream)", uni_payload, echo):
         passed += 1
     else:
@@ -163,7 +161,7 @@ async def demo_mode(client: WebTransportClient):
     # Collect all echoed datagrams
     received_dgrams: list[bytes] = []
     for _ in dgram_payloads:
-        echo = await client.receive_datagram(timeout=2.0)
+        echo = await client.receive_datagram_echo(timeout=2.0)
         if echo is not None:
             received_dgrams.append(echo)
 
@@ -265,8 +263,7 @@ async def scenario_mode(client: WebTransportClient):
             if action == "uni":
                 await client.send_unidirectional_stream(data)
                 logger.info("uni(%s) — sent %d bytes", arg, len(data))
-                result = await client.receive_stream_data(timeout=2.0)
-                echo = result[1] if result else None
+                echo = await client.receive_stream_echo(timeout=2.0)
                 _check_echo(f"uni({arg})", data, echo)
 
             elif action == "bidi":
@@ -279,7 +276,7 @@ async def scenario_mode(client: WebTransportClient):
             elif action == "datagram":
                 client.send_datagram(data)
                 logger.info("datagram(%s) — sent %d bytes", arg, len(data))
-                echo = await client.receive_datagram(timeout=2.0)
+                echo = await client.receive_datagram_echo(timeout=2.0)
                 _check_echo(f"datagram({arg})", data, echo)
 
             elif action == "capsule":
