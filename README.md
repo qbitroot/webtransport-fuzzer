@@ -1,5 +1,71 @@
 # webtransport-fuzzer
 
+## Setup
+
+**Requirements:** Python ≥ 3.11, [`uv`](https://github.com/astral-sh/uv), Rust toolchain (for wtransport), Go ≥ 1.21 (for webtransport-go).
+
+### Install toolchains (Ubuntu)
+
+```bash
+# Rust (via rustup — do not use apt, it ships an old version)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Go (replace 1.26.3 with latest from https://go.dev/dl/)
+wget https://go.dev/dl/go1.26.3.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go1.26.3.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+
+# uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+```
+
+### Clone and build
+
+```bash
+git clone <repo>
+cd webtransport-fuzzer
+uv sync
+
+# Build the Go server (one-time)
+cd server/webtransport-go
+go build -o webtransport-go-server .
+cd ../..
+
+# Build the Rust server (one-time; also done automatically on first launch)
+cargo build --manifest-path server/wtransport/Cargo.toml --release
+```
+
+## Running
+
+```bash
+# Fuzz aioquic (Python server, starts automatically)
+uv run launch.py aioquic all
+
+# Fuzz wtransport (Rust server, first run compiles — takes ~2 min)
+uv run launch.py wtransport all
+
+# Fuzz the Go server, sc-capsule mode
+uv run launch.py go sc-capsule
+
+# Resume from a specific test case index
+uv run launch.py aioquic oneshot --start-index 500
+```
+
+Each run writes `logs/<server>_<mode>_<timestamp>.db` and `logs/<server>_<mode>_<timestamp>.server.log`, then automatically stitches the server log into the DB via `correlate_logs.py`.
+
+## Checking compliance
+
+```bash
+uv run check_compliance.py --db logs/<stem>.db
+uv run check_compliance.py --db logs/<stem>.db --draft both
+```
+
+---
+
 Boofuzz-based fuzzer for the [WebTransport over HTTP/3](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/) protocol.
 
 Targets the capsule layer on the CONNECT stream and data transports (bidirectional streams, unidirectional streams, datagrams). Tested against local server implementations in the `server/` directory:
@@ -9,30 +75,6 @@ Targets the capsule layer on the CONNECT stream and data transports (bidirection
 - **`server/webtransport-go`** — Go echo server using [webtransport-go](https://github.com/quic-go/webtransport-go) (HTTP/3 over QUIC, self-signed TLS, listens on `0.0.0.0:6002`)
 
 ---
-
-## Quick start
-
-```bash
-# Validate connection (aioquic default port)
-uv run python main.py --no-fuzz --url https://127.0.0.1:6000/echo
-
-# One-shot capsule fuzzer against aioquic (port 6000, web UI :26000)
-uv run launch.py run aioquic oneshot
-
-# Sc-shuffle against wtransport (port 6001, web UI :26001)
-uv run launch.py run wtransport sc-shuffle
-
-# Sc-capsule against go server (port 6002, web UI :26002)
-uv run launch.py run go sc-capsule
-
-# All modes combined in a single run
-uv run python main.py --mode all --url https://127.0.0.1:6000/echo
-
-# Resume from a specific test case index
-uv run python main.py --mode sc-shuffle --start-index 42 --end-index 100
-
-# boofuzz web UI: aioquic=:26000  wtransport=:26001  go=:26002
-```
 
 ---
 
@@ -164,7 +206,7 @@ WTFUZZ|<conn_idx>|EVENT|key1=val1|key2=val2|...
 After a fuzzing run, correlate test cases with server output offline:
 
 ```bash
-uv run analyze_logs.py --log server.log --db boofuzz-results/run_<timestamp>.db
+uv run correlate_logs.py --log server.log --db boofuzz-results/run_<timestamp>.db
 ```
 
 #### Event catalog
@@ -208,7 +250,7 @@ src/
   request_logger.py       — boofuzz monitor that writes test cases to SQLite
   log_db.py               — SQLite schema + access
   server_manager.py       — optional server subprocess lifecycle
-analyze_logs.py           — offline log correlation tool
+correlate_logs.py         — offline log correlation tool
 get-server-version.py     — server draft-version fingerprinting tool
 server/
   aioquic/                — Python echo server (draft-03)
