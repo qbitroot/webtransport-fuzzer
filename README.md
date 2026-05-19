@@ -45,17 +45,20 @@ cargo build --manifest-path server/wtransport/Cargo.toml --release
 ## Running
 
 ```bash
-# Fuzz aioquic (Python server, starts automatically)
+# Fuzz aioquic (Python server)
 uv run launch.py aioquic all
 
-# Fuzz wtransport (Rust server, first run compiles — takes ~2 min)
+# Fuzz wtransport (Rust server)
 uv run launch.py wtransport all
 
-# Fuzz the Go server, sc-capsule mode
-uv run launch.py go sc-capsule
+# Fuzz webtransport-go (Go server)
+uv run launch.py go all
+
+# Fuzz oneshot mode only
+uv run launch.py aioquic oneshot
 
 # Resume from a specific test case index
-uv run launch.py aioquic oneshot --start-index 500
+uv run launch.py aioquic all --start-index 500
 ```
 
 Each run writes `logs/<server>_<mode>_<timestamp>.db` and `logs/<server>_<mode>_<timestamp>.server.log`, then automatically stitches the server log into the DB via `correlate_logs.py`.
@@ -170,7 +173,7 @@ Test cases = 12 scenarios × 1,879 spec-typed blobs, deduplicated → **22,548 t
 
 Runs oneshot, sc-shuffle, and sc-capsule in one session, all executed via the same scenario executor (oneshot blobs wrapped as single-step scenarios).
 
-**Total: 40,083 test cases** (16,016 + 1,520 + 22,548 = 40,084 pre-dedup; one collision).
+**Total: 40,082 test cases** (16,016 + 1,520 + 22,548 = 40,084 pre-dedup; two collisions).
 
 ---
 
@@ -292,3 +295,23 @@ server/
 - TLS verification is disabled by default (self-signed certs). Use `--no-verify` with `server_version.py`.
 - To test from a browser: install mkcert and launch Chrome with `--origin-to-force-quic-on=127.0.0.1:6000`. Chrome does not support [localhost TLS for HTTP/3](https://news.ycombinator.com/item?id=41748640).
 - The boofuzz web UI ports: aioquic=26000, wtransport=26001, go=26002 (set per server in `launch.py`).
+
+---
+
+## Results
+
+Full-corpus `all` mode (40,082 unique test cases; 40,084 pre-dedup, two collisions removed) was run against each target.
+
+| Target                       | Cases  | Distinct log groups | Crashes / panics                | Spec violations                          |
+| ---------------------------- | ------ | ------------------- | ------------------------------- | ---------------------------------------- |
+| **aioquic** (draft-03)       | 40,082 | 48                  | 0                               | **1** — `WEBTRANSPORT_STREAM` on CONNECT |
+| **wtransport** (draft-09)    | 40,082 | 255                 | **7,594 cases / 213 unique outputs** | (panic-class; assert reachable from network) |
+| **webtransport-go** (HTTP/3) | 40,082 | 47                  | 0                               | 0                                        |
+
+`Distinct log groups` is the number of unique SHA-256 server-output fingerprints — a rough proxy for behavioural diversity (and for wtransport, the 213 panic-bearing fingerprints reflect different surrounding traffic / stream-ID contexts that hit the same underlying assert).
+
+### Findings summary
+
+- **wtransport** — Reachable `assert!(matches!(frame.kind(), FrameKind::Data))` in `wtransport-proto/src/capsule/mod.rs:38`. Any `Headers`/`Exercise` frame on the CONNECT stream is passed through `validate_frame` but trips the assert in `Capsule::with_frame`, panicking the tokio worker (with a secondary `"Driver worker panic!"` in `driver/mod.rs:233`). 7,594 / 40,082 (≈19%) test cases reproduce it across 213 distinct server output groups.
+- **aioquic** — `H3Connection` accepts `WEBTRANSPORT_STREAM` (0x41) on the already-established CONNECT stream (`h3/connection.py:996`), silently re-typing it as a WT data stream with attacker-controlled `session_id`. No crash; the session is silently corrupted and torn down with QUIC code 0x0. Violates draft-ietf-webtrans-http3 §4.2 (`MUST` be `H3_FRAME_ERROR`). Detected via a unique fingerprint containing `RECV_BIDI|stream_id=0` (85 test cases hit it).
+- **webtransport-go** — No crashes and no spec-violating fingerprints observed across the full corpus.
