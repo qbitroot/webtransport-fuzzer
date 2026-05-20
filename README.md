@@ -253,8 +253,6 @@ uv run correlate_logs.py --log server.log --db boofuzz-results/run_<timestamp>.d
 
 Standard logging (warnings, stack traces) goes to **stderr** and is not captured by the pipeline. Any server line not starting with `WTFUZZ|` is flagged as `[SERVER RAW]` — these typically indicate panics or assertion failures.
 
-> **Note (webtransport-go):** The `webtransport-go` library does not expose the underlying QUIC stream ID through its API, so `RECV_BIDI`, `RECV_UNI`, and `ECHO` events from `server/webtransport-go` omit the `stream_id` field. This is a library limitation and does not affect fuzzing coverage.
-
 ### Adding a new server
 
 1. Maintain a global connection counter (starting at 0).
@@ -286,6 +284,13 @@ server/
   wtransport/             — Rust echo server (draft-09)
   webtransport-go/        — Go echo server (webtransport-go / HTTP3+QUIC)
 ```
+
+---
+
+## Restrictions
+
+- **webtransport-go logging is coarser.** The [`webtransport-go`](https://github.com/quic-go/webtransport-go) library does not expose the underlying QUIC stream ID through its public API, so `RECV_BIDI`, `RECV_UNI`, and `ECHO` events from `server/webtransport-go/main.go` omit the `stream_id` field. Per-stream correlation in the SQLite log is consequently weaker for that target than for aioquic or wtransport; fuzzing inputs and crash detection are unaffected.
+- **Coverage surface.** WebTransport over HTTP/3 is a fairly thin layer on top of HTTP/3 + QUIC: an Extended CONNECT request stream whose data stream carries WebTransport control capsules (using the RFC 9297 capsule framing), plus WebTransport bidi streams, uni streams, and QUIC datagrams for data. The fuzzer exercises all four channels — that is essentially the entire WebTransport-specific surface. What it deliberately does *not* fuzz is the much larger machinery underneath (QUIC framing, the HTTP/3 frame layer, TLS 1.3, congestion/flow control internals); bugs at those layers are out of scope and would need a QUIC- or HTTP/3-level fuzzer.
 
 ---
 
