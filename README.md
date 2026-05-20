@@ -195,20 +195,43 @@ All test cases are recorded to a SQLite database (`boofuzz-results/run_<timestam
 
 Schema:
 
-```
-test_cases
-  id              INTEGER PRIMARY KEY
-  test_index      INTEGER              -- boofuzz mutant index
-  sent_data       TEXT                 -- newline-separated steps (see below)
-  is_healthcheck  INTEGER              -- 1 for post-test echo probes
-  log_group_id    INTEGER FK           -- references log_groups(id)
-  timestamp       REAL
+```sql
+CREATE TABLE log_groups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL UNIQUE,   -- SHA-256 of joined server output lines
+    raw_text    TEXT NOT NULL           -- full server output for this group
+);
 
-log_groups
-  id              INTEGER PRIMARY KEY
-  fingerprint     TEXT UNIQUE          -- SHA-256 of joined server output lines
-  raw_text        TEXT                 -- full server output for this group
+CREATE TABLE test_cases (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_index      INTEGER,                          -- boofuzz mutant index
+    sent_data       TEXT,                             -- newline-separated steps (see below)
+    is_healthcheck  INTEGER NOT NULL DEFAULT 0,       -- 1 for post-test echo probes
+    log_group_id    INTEGER REFERENCES log_groups(id),
+    timestamp       REAL NOT NULL
+);
+
+CREATE INDEX idx_tc_log_group ON test_cases(log_group_id);
 ```
+
+How `compare_db.py` uses this schema:
+
+```sql
+-- Pull every non-healthcheck case joined to its server output:
+SELECT tc.id, tc.sent_data, lg.raw_text
+FROM test_cases tc
+LEFT JOIN log_groups lg ON tc.log_group_id = lg.id
+WHERE tc.is_healthcheck = 0
+ORDER BY tc.id;
+```
+
+Rows are then keyed by a normalised `sent_data` (lower-cased, trimmed,
+empty lines dropped) and the matching `raw_text` blobs from two
+databases are diffed line-by-line. With `--strip-extra`, each
+`WTFUZZ|<conn_idx>|EVENT|key=val|...` line is reduced to just
+`WTFUZZ|EVENT` so transient `stream_id` / `session_id` values don't
+produce spurious mismatches; non-`WTFUZZ` lines (panics, tracebacks)
+are kept verbatim.
 
 **`sent_data` format** — one line per step, each in `action(hex-payload)` form:
 
@@ -290,7 +313,7 @@ server/
 ## Restrictions
 
 - **webtransport-go logging is coarser.** The [`webtransport-go`](https://github.com/quic-go/webtransport-go) library does not expose the underlying QUIC stream ID through its public API, so `RECV_BIDI`, `RECV_UNI`, and `ECHO` events from `server/webtransport-go/main.go` omit the `stream_id` field. Per-stream correlation in the SQLite log is consequently weaker for that target than for aioquic or wtransport; fuzzing inputs and crash detection are unaffected.
-- **Coverage surface.** WebTransport over HTTP/3 is a fairly thin layer on top of HTTP/3 + QUIC: an Extended CONNECT request stream whose data stream carries WebTransport control capsules (using the RFC 9297 capsule framing), plus WebTransport bidi streams, uni streams, and QUIC datagrams for data. The fuzzer exercises all four channels — that is essentially the entire WebTransport-specific surface. What it deliberately does *not* fuzz is the much larger machinery underneath (QUIC framing, the HTTP/3 frame layer, TLS 1.3, congestion/flow control internals); bugs at those layers are out of scope and would need a QUIC- or HTTP/3-level fuzzer.
+- **Coverage surface.** WebTransport over HTTP/3 is a fairly thin layer on top of HTTP/3 + QUIC: an Extended CONNECT request stream whose data stream carries WebTransport control capsules (using the RFC 9297 capsule framing), plus WebTransport bidi streams, uni streams, and QUIC datagrams for data. The fuzzer exercises all four channels — that is essentially the entire WebTransport-specific surface. What it deliberately does _not_ fuzz is the much larger machinery underneath (QUIC framing, the HTTP/3 frame layer, TLS 1.3, congestion/flow control internals); bugs at those layers are out of scope and would need a QUIC- or HTTP/3-level fuzzer.
 
 ---
 
@@ -307,11 +330,11 @@ server/
 
 Full-corpus `all` mode (40,082 unique test cases; 40,084 pre-dedup, two collisions removed) was run against each target.
 
-| Target                       | Cases  | Distinct log groups | Crashes / panics                | Spec violations                          |
-| ---------------------------- | ------ | ------------------- | ------------------------------- | ---------------------------------------- |
-| **aioquic** (draft-03)       | 40,082 | 48                  | 0                               | **1** — `WEBTRANSPORT_STREAM` on CONNECT |
+| Target                       | Cases  | Distinct log groups | Crashes / panics                     | Spec violations                              |
+| ---------------------------- | ------ | ------------------- | ------------------------------------ | -------------------------------------------- |
+| **aioquic** (draft-03)       | 40,082 | 48                  | 0                                    | **1** — `WEBTRANSPORT_STREAM` on CONNECT     |
 | **wtransport** (draft-09)    | 40,082 | 255                 | **7,594 cases / 213 unique outputs** | (panic-class; assert reachable from network) |
-| **webtransport-go** (HTTP/3) | 40,082 | 47                  | 0                               | 0                                        |
+| **webtransport-go** (HTTP/3) | 40,082 | 47                  | 0                                    | 0                                            |
 
 `Distinct log groups` is the number of unique SHA-256 server-output fingerprints — a rough proxy for behavioural diversity (and for wtransport, the 213 panic-bearing fingerprints reflect different surrounding traffic / stream-ID contexts that hit the same underlying assert).
 
