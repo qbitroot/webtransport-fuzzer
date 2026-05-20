@@ -330,11 +330,11 @@ server/
 
 Full-corpus `all` mode (40,082 unique test cases; 40,084 pre-dedup, two collisions removed) was run against each target.
 
-| Target                       | Cases  | Distinct log groups | Crashes / panics                     | Spec violations                              |
-| ---------------------------- | ------ | ------------------- | ------------------------------------ | -------------------------------------------- |
-| **aioquic** (draft-03)       | 40,082 | 48                  | 0                                    | **1** — `WEBTRANSPORT_STREAM` on CONNECT     |
-| **wtransport** (draft-09)    | 40,082 | 255                 | **7,594 cases / 213 unique outputs** | (panic-class; assert reachable from network) |
-| **webtransport-go** (HTTP/3) | 40,082 | 47                  | 0                                    | 0                                            |
+| Target                         | Cases  | Distinct log groups | Crashes / panics                     | Spec violations                              |
+| ------------------------------ | ------ | ------------------- | ------------------------------------ | -------------------------------------------- |
+| **aioquic** (draft-03)         | 40,082 | 48                  | 0                                    | **1** — `WEBTRANSPORT_STREAM` on CONNECT     |
+| **wtransport** (draft-09)      | 40,082 | 255                 | **7,594 cases / 213 unique outputs** | (panic-class; assert reachable from network) |
+| **webtransport-go** (draft-03) | 40,082 | 47                  | 0                                    | 0                                            |
 
 `Distinct log groups` is the number of unique SHA-256 server-output fingerprints — a rough proxy for behavioural diversity (and for wtransport, the 213 panic-bearing fingerprints reflect different surrounding traffic / stream-ID contexts that hit the same underlying assert).
 
