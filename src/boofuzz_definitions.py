@@ -7,15 +7,12 @@ from boofuzz import (
     s_dword,
     s_string,
 )
+import struct
 
 # =============================================================================
 # WebTransport over HTTP/3 Constants
 # https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-14
 # =============================================================================
-
-# Stream Type / Signal Constants (VarInt encoded)
-WT_STREAM_TYPE_UNI = b"\x40\x54"  # 0x54 = 84, unidirectional WebTransport stream type
-WT_STREAM_TYPE_BIDI = b"\x40\x41"  # 0x41 = 65, bidirectional WT_STREAM signal value
 
 # Capsule Type Constants (VarInt encoded per RFC 9000 §16)
 # 0x2843 = 10307 -> 2-byte VarInt: (0x40 | (10307 >> 8)), (10307 & 0xFF) = 0x68, 0x43
@@ -39,8 +36,6 @@ CAPSULE_STREAMS_BLOCKED_UNI = b"\x99\x0b\x4d\x44"  # WT_STREAMS_BLOCKED uni (0x1
 # explicitly PROHIBITED in draft-ietf-webtrans-http3-14 §5.4: per-stream flow control
 # is handled by QUIC natively; receipt MUST be treated as a session error.
 # WT_RESET_STREAM and WT_STOP_SENDING are QUIC-level frames, not WebTransport capsules.
-
-import struct
 
 
 def encode_quic_varint(value):
@@ -98,7 +93,7 @@ INTERESTING_NUMBERS = [
     16385,  # 4-byte min
     8191,
     8192,
-    8193,  # WT_CLOSE_SESSION application error max
+    8193,  # 13-bit boundary
     65535,
     65536,  # 16-bit boundaries
     1073741822,
@@ -112,9 +107,9 @@ INTERESTING_NUMBERS = [
     # ---- Cross-protocol numeric boundaries (added for thesis breadth) ----
     2147483647,  # INT32_MAX — common signed-int overflow trigger in C parsers
     2147483648,  # INT32_MAX + 1 — first value that overflows a signed int32
-    8388607,  # HTTP/2 SETTINGS_INITIAL_WINDOW_SIZE max (RFC 9113 §6.5.2: 2^31-1
-    # is the cap, but 2^23-1 = 16MB is the per-frame DATA limit; tests parsers
-    # that erroneously reuse HTTP/2 window-size constants for capsule sizing)
+    8388607,  # 2^23 - 1 — HTTP/2 DATA frame length limit (RFC 9113 §4.1);
+    # tests parsers that erroneously reuse HTTP/2 frame-length constants for
+    # capsule sizing.
     9007199254740992,  # JS Number.MAX_SAFE_INTEGER + 1; tests JS-runtime
     # implementations (e.g. Node.js WebTransport stacks) where IEEE-754 mantissa
     # precision is lost beyond 2^53.
@@ -134,7 +129,7 @@ MALFORMED_VARINTS = [
     b"\x28\x43",  # CLOSE raw bytes (parsed as 1-byte 0x28 + extra, not 0x2843)
     # Boundary / truncation cases
     b"\x3f",  # Max 1-byte VarInt (63)
-    b"\x7f\xff",  # Invalid: top bits 01 but MSB of second byte set (not a standard VarInt)
+    b"\x7f\xff",  # Canonical 2-byte VarInt for 16383 (also produced via INTERESTING_NUMBERS)
     b"\xff",  # Invalid: 8-byte prefix (0xC0) but only 1 byte provided
     b"\x80\x00",  # Truncated 4-byte VarInt (only 2 of 4 bytes)
     b"\xc0\x00\x00\x00",  # Truncated 8-byte VarInt (only 4 of 8 bytes)
@@ -186,8 +181,10 @@ INCORRECT_QUIC_FRAMES = [
     b"\x1c",  # CONNECTION_CLOSE (QUIC error)
     b"\x1d",  # CONNECTION_CLOSE (app error)
     b"\x1e",  # HANDSHAKE_DONE
-    # HTTP/3 frame types (RFC 9114 §7.2)
-    # 0x00 and 0x01 overlap with QUIC above; add the distinct ones
+    # HTTP/3 frame types (RFC 9114 §7.2). Some single-byte values overlap with
+    # the QUIC frame types above (e.g. 0x03, 0x04, 0x05, 0x07); duplicates are
+    # collapsed by the dedup in ALL_INTERESTING_BYTES, but they are listed here
+    # under their HTTP/3 names for documentation clarity.
     b"\x03",  # CANCEL_PUSH
     b"\x04",  # SETTINGS
     b"\x05",  # PUSH_PROMISE
@@ -239,8 +236,8 @@ def _build_raw_fuzz_blobs() -> list:
 
     * **Type-only frames**: a single interesting byte sequence with no
       length and no body. Triggers truncation paths and single-byte
-      garbage handling (e.g. ``b"\\x41"`` — WT_STREAM signal byte sent
-      as a complete capsule).
+      garbage handling (e.g. ``b"\\x00"`` — unknown capsule type sent as
+      a complete capsule).
 
     * **Type + length, no body**: an interesting type followed by an
       interesting (often invalid) length byte sequence and no payload.
@@ -249,8 +246,8 @@ def _build_raw_fuzz_blobs() -> list:
     * **Type + matched length + body**: an interesting type with a
       canonically-encoded length matching the body. Tests well-framed
       capsules carrying foreign payload — including cross-layer type
-      confusion (e.g. ``b"\\x40\\x41\\x01\\xff"`` — WT_STREAM signal
-      type carrying a single foreign byte).
+      confusion (e.g. a QUIC ``RESET_STREAM`` byte ``b"\\x04"`` used as
+      a capsule type carrying foreign payload).
 
     Returns a deduplicated, order-preserving list of byte blobs.
     """
@@ -468,7 +465,7 @@ def build_close_session(error_code: int = 0, message: str = "") -> bytes:
 
 def build_drain_session() -> bytes:
     """WT_DRAIN_SESSION (0x78AE): empty payload."""
-    return CAPSULE_DRAIN_SESSION + b"\x00"
+    return _wrap(CAPSULE_DRAIN_SESSION, b"")
 
 
 def build_max_data(limit: int) -> bytes:
