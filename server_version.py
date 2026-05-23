@@ -2,7 +2,7 @@
 """WebTransport draft version probe tool.
 
 Usage:
-    uv run test.py <host> <port> [--path /echo] [--cert ca.pem] [--no-verify]
+    uv run server_version.py <host> <port> [--path /echo] [--cert ca.pem] [--no-verify]
 """
 
 import argparse

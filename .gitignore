@@ -1,7 +1,6 @@
 # Byte-compiled / optimized / DLL files
-boofuzz-results/
-failures/
 logs/
+wt_fuzz_*.db
 __pycache__/
 *.py[codz]
 *$py.class

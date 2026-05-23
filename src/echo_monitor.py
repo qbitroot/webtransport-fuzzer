@@ -7,8 +7,10 @@ Two things happen around each test case:
    bidi echo of the magic bytes ``HEALTHCHECK`` is sent on the
    still-fresh WebTransport session. This confirms the echo path is
    functional *before* the malformed data is injected. A failure here
-   means the session was broken before we even fuzzed — the test case is
-   marked as a boofuzz failure and written to ``failures/``.
+   means the session was broken before we even fuzzed — the test case
+   is escalated to a boofuzz failure via ``fuzz_data_logger.log_fail``.
+   Boofuzz captures the event in its in-memory log / web UI; the per-step
+   record is already in the SQLite log DB written by ``RequestLogger``.
 
 2. **Post-send per-step echo logging.** For every executed step the
    connection recorded a ``StepOutcome`` (echo bytes, match/no-match,
@@ -23,9 +25,7 @@ that. This keeps exactly one QUIC handshake per test case.
 from __future__ import annotations
 
 import logging
-import os
-import time
-from typing import List, Optional
+from typing import List
 
 from boofuzz.monitors.base_monitor import BaseMonitor
 
@@ -33,44 +33,6 @@ from src.fuzzer_connection import StepOutcome
 from src.sequence_mutator import Step
 
 logger = logging.getLogger(__name__)
-
-
-class ServerDownError(Exception):
-    """Raised when the target server is unreachable."""
-
-
-FAILURES_DIR = "failures"
-os.makedirs(FAILURES_DIR, exist_ok=True)
-
-
-def _save_failure(
-    steps: List[Step],
-    outcomes: List[StepOutcome],
-    health: Optional[StepOutcome],
-    reason: str,
-) -> str:
-    """Append a human-readable failure record to ``failures/`` and return path."""
-    ts = int(time.time() * 1000)
-    path = os.path.join(FAILURES_DIR, f"failure_{ts}.txt")
-    with open(path, "w") as f:
-        f.write(f"reason: {reason}\n")
-        f.write("steps:\n")
-        for i, (step, outcome) in enumerate(zip(steps, outcomes)):
-            f.write(f"  [{i}] {step.action}({step.data.hex()})\n")
-            if outcome.error is not None:
-                f.write(f"      error: {outcome.error}\n")
-            if outcome.echo_received is not None:
-                f.write(f"      echo : {outcome.echo_received.hex()}\n")
-            if outcome.echo_match is False:
-                f.write("      echo_match: NO\n")
-        if health is not None:
-            f.write("health_check:\n")
-            if health.error is not None:
-                f.write(f"  error: {health.error}\n")
-            if health.echo_received is not None:
-                f.write(f"  echo : {health.echo_received.hex()}\n")
-            f.write(f"  echo_match: {health.echo_match}\n")
-    return path
 
 
 class EchoCompareMonitor(BaseMonitor):
@@ -102,20 +64,19 @@ class EchoCompareMonitor(BaseMonitor):
         health = conn.health_check(timeout=self.probe_timeout)
         if health.echo_match is True:
             fuzz_data_logger.log_check("pre_send health_check: echo OK")
+            return
+
+        if health.error is not None:
+            fuzz_data_logger.log_fail(
+                f"pre_send health_check: probe raised {health.error}"
+            )
+        elif health.echo_received is None:
+            fuzz_data_logger.log_fail("pre_send health_check: no echo received")
         else:
-            if health.error is not None:
-                fuzz_data_logger.log_fail(
-                    f"pre_send health_check: probe raised {health.error}"
-                )
-            elif health.echo_received is None:
-                fuzz_data_logger.log_fail("pre_send health_check: no echo received")
-            else:
-                fuzz_data_logger.log_fail(
-                    f"pre_send health_check: echo mismatch "
-                    f"(got {health.echo_received!r})"
-                )
-            path = _save_failure([], [], health, "pre_send health_check failed")
-            fuzz_data_logger.log_fail(f"saved failure to {path}")
+            fuzz_data_logger.log_fail(
+                f"pre_send health_check: echo mismatch "
+                f"(got {health.echo_received!r})"
+            )
 
     def post_send(self, target, fuzz_data_logger, session, *args, **kwargs):
         """Log per-step echo results after the fuzz payload."""
@@ -128,7 +89,7 @@ class EchoCompareMonitor(BaseMonitor):
         outcomes: List[StepOutcome] = getattr(conn, "last_step_outcomes", []) or []
 
         # Log every step's echo result.
-        mismatches = []
+        mismatch_details: List[str] = []
         for i, (step, outcome) in enumerate(zip(steps, outcomes)):
             if step.action == "capsule":
                 continue
@@ -142,19 +103,25 @@ class EchoCompareMonitor(BaseMonitor):
                     fuzz_data_logger.log_info(
                         f"step[{i}] {step.action}: no echo received"
                     )
+                    mismatch_details.append(
+                        f"step[{i}] {step.action}({len(step.data)}B): no echo"
+                    )
                 else:
                     fuzz_data_logger.log_info(
                         f"step[{i}] {step.action}: echo mismatch "
                         f"(sent {len(step.data)}B, got {len(got)}B)"
                     )
-                mismatches.append(i)
+                    mismatch_details.append(
+                        f"step[{i}] {step.action}: sent {len(step.data)}B, "
+                        f"got {len(got)}B"
+                    )
 
-        # Escalate per-step mismatches if requested.
-        if mismatches and self.fail_on_mismatch:
-            health = getattr(conn, "last_health_check", None)
-            path = _save_failure(steps, outcomes, health, "echo mismatch")
+        # Escalate per-step mismatches if requested. The same per-step
+        # record is persisted to the SQLite log DB by RequestLogger, so
+        # there's no need to also write a separate failure file here.
+        if mismatch_details and self.fail_on_mismatch:
             fuzz_data_logger.log_fail(
-                f"echo mismatches at steps {mismatches}; saved to {path}"
+                "echo mismatches: " + "; ".join(mismatch_details)
             )
 
         return True

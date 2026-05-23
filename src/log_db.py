@@ -44,7 +44,7 @@ class LogDB:
         test_cases   — each fuzzer request, pointing to a log_group
 
     sent_data is stored as newline-separated hex strings (one per write).
-    Use encode_sent() / decode_sent() to convert to/from step strings.
+    Use encode_sent() to produce the column value from step strings.
 
     Usage:
         db = LogDB("fuzzer_logs.db")
@@ -94,16 +94,6 @@ class LogDB:
         if not steps:
             return None
         return "\n".join(steps)
-
-    @staticmethod
-    def decode_sent(sent_data: Optional[str]) -> list[str]:
-        """
-        Split a stored sent_data column back into individual step strings.
-        Returns an empty list if sent_data is None or empty.
-        """
-        if not sent_data:
-            return []
-        return sent_data.splitlines()
 
     def record_test_case(
         self,

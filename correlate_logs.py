@@ -10,7 +10,7 @@ This script groups the log into sessions by conn_idx, pairs them 1:1 with
 ``test_cases`` rows by insertion order, and fills in ``log_group_id``.
 
 Usage:
-    python correlate_logs.py --log server.log --db boofuzz-results/run_XYZ.db
+    python correlate_logs.py --log server.log --db logs/<stem>.db
 
 Pairing rule:
     conn_idx 0 ↔ test_cases.id 1

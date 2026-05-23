@@ -219,10 +219,12 @@ class WebTransportConnection(ITargetConnection):
 
     def recv(self, max_bytes: int) -> bytes:
         """
-        Required by ``ITargetConnection``; not used by our fuzzing flow.
+        Required by ``ITargetConnection``; called by boofuzz after every
+        ``send`` but intentionally a no-op for this fuzzer.
 
         Echoes are captured per-step inside ``_run_scenario`` and exposed
-        via ``last_step_outcomes`` rather than the boofuzz recv channel.
+        via ``last_step_outcomes`` rather than the boofuzz recv channel,
+        so an empty byte string is returned here.
         """
         return b""
 

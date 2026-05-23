@@ -40,8 +40,6 @@ LOG_FMT = "%(asctime)s [%(levelname)5s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger("wt_fuzzer")
 
-os.makedirs("failures", exist_ok=True)
-
 # Loggers that are noisy per-test-case (open/close/session setup lines).
 # Quieted to WARNING by default; -v restores them to INFO.
 _NOISY_LOGGERS = [
@@ -63,7 +61,7 @@ def _configure_logging(verbose: bool) -> None:
 _MODE_DESCRIPTIONS = {
     "oneshot": "One-shot (single malformed capsule per connection)",
     "sc-shuffle": "Sc-shuffle (step-reordering mutations on named scenarios)",
-    "sc-capsule": "Sc-capsule (malformed capsule injected at first/last step)",
+    "sc-capsule": "Sc-capsule (malformed capsule injected at the last step)",
     "all": "All modes combined (oneshot + sc-shuffle + sc-capsule)",
 }
 
@@ -111,7 +109,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--db",
         type=str,
         default=None,
-        help="Path to the SQLite log DB (default: boofuzz-results/run_<timestamp>.db).",
+        help="Path to the SQLite log DB (default: ./wt_fuzz_<timestamp>.db in CWD).",
     )
     p.add_argument(
         "--web-port",
@@ -200,8 +198,9 @@ def _run_fuzz(args: argparse.Namespace) -> int:
     from src.log_db import LogDB
     from src.request_logger import RequestLogger
 
-    os.makedirs("boofuzz-results", exist_ok=True)
-    db_path = args.db or os.path.join("boofuzz-results", f"run_{int(time.time())}.db")
+    # Default to a single file in CWD when --db is not given; this avoids
+    # auto-creating a directory (launch.py always passes --db logs/...).
+    db_path = args.db or f"wt_fuzz_{int(time.time())}.db"
     log_db = LogDB(db_path)
     logger.info("Log database: %s", db_path)
 

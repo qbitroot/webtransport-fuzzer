@@ -191,7 +191,7 @@ uv run server_version.py --no-verify 127.0.0.1 6161
 
 ### SQLite log database
 
-All test cases are recorded to a SQLite database (`boofuzz-results/run_<timestamp>.db`). Specify a path with `--db`.
+All test cases are recorded to a SQLite database. The documented entry point `launch.py` writes to `logs/<server>_<mode>_<timestamp>.db`. When invoking `main.py` directly, a default `wt_fuzz_<timestamp>.db` is created in the current directory; override with `--db <path>`.
 
 Schema:
 
@@ -258,7 +258,7 @@ WTFUZZ|<conn_idx>|EVENT|key1=val1|key2=val2|...
 After a fuzzing run, correlate test cases with server output offline:
 
 ```bash
-uv run correlate_logs.py --log server.log --db boofuzz-results/run_<timestamp>.db
+uv run correlate_logs.py --log server.log --db logs/<stem>.db
 ```
 
 #### Event catalog

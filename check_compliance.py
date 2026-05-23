@@ -8,7 +8,7 @@ optionally correlated by correlate_logs.py), checks server responses for
 compliance violations, and reports problems grouped by log_group.
 
 Usage:
-    uv run python check_compliance.py --db boofuzz-results/run_<ts>.db
+    uv run python check_compliance.py --db logs/<stem>.db
     uv run python check_compliance.py --db run.db --draft 03
     uv run python check_compliance.py --db run.db --draft both
 """

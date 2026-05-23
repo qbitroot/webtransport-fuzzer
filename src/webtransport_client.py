@@ -42,7 +42,6 @@ class WebTransportClient(QuicConnectionProtocol):
         self._http: Optional[H3Connection] = None
         self._session_id: Optional[int] = None
         self._session_established = asyncio.Event()
-        self._authority: Optional[str] = None
 
         # Per-stream response queues for tracked bidirectional streams.
         self._bidi_response_queues: Dict[int, asyncio.Queue] = {}
@@ -91,7 +90,6 @@ class WebTransportClient(QuicConnectionProtocol):
 
     async def establish_session(self, authority: str, path: str = "/echo"):
         """Send the WebTransport CONNECT request and wait for the 200 response."""
-        self._authority = authority
         stream_id = self._quic.get_next_available_stream_id()
 
         headers = [
